@@ -2,8 +2,8 @@
 
 Aplikasi web lokal untuk:
 
-1. **Hapus Vokal & Subtitle:** Menghapus vokal dari file audio/video menggunakan Demucs (`htdemucs`), membuat _subtitle_ `.srt` dari trek vokal menggunakan Faster-Whisper, dan menggabungkan _hardsub_ + audio instrumental dengan FFmpeg.
-2. **Pisah Instrumen & Mixer:** Memisahkan 6 _stem_ (`drums`, `bass`, `guitar`, `piano`, `other`, `vocals`) menggunakan `htdemucs_6s`, memutarnya secara _real-time_ di _browser_ dengan kontrol volume, _panning_ kiri/kanan, _solo_, _mute_, _metronome_ (BPM, volume, _panning_), serta _export_ hasil _mix_ ke `.wav`.
+1. **Hapus Vokal & Subtitle:** Menghapus vokal dari file lokal maupun link YouTube menggunakan Demucs (`htdemucs`), membuat _subtitle_ `.srt` dari trek vokal menggunakan Faster-Whisper, dan menggabungkan _hardsub_ + audio instrumental dengan FFmpeg (atau memilih hasil audio `.mp3` saja).
+2. **Pisah Instrumen & Mixer:** Memisahkan 6 _stem_ (`drums`, `bass`, `guitar`, `piano`, `other`, `vocals`) menggunakan `htdemucs_6s` dari file lokal maupun link YouTube (video otomatis dikonversi ke audio), mendeteksi tempo (BPM) secara otomatis dengan `librosa`, memutarnya secara _real-time_ di _browser_ dengan kontrol volume, _panning_ kiri/kanan, _solo_, _mute_, _metronome_ (auto BPM / manual, volume, _panning_), serta _export_ hasil _mix_ ke `.wav`.
 
 ---
 
@@ -36,7 +36,7 @@ Jika repository sudah ada di lokal dan baru melakukan _pull_ pembaruan:
 git pull origin main
 ```
 
-### 2. Setup & Jalankan Backend (FastAPI + Demucs + Faster-Whisper)
+### 2. Setup & Jalankan Backend (FastAPI + Demucs + Whisper + yt-dlp + Librosa)
 
 Buka terminal, masuk ke folder `backend`, lalu buat dan aktifkan _virtual environment_:
 
@@ -51,6 +51,10 @@ Aktifkan `.venv`:
   ```powershell
   .\.venv\Scripts\Activate.ps1
   ```
+- **Git Bash (Windows):**
+  ```bash
+  source .venv/Scripts/activate
+  ```
 - **macOS / Linux:**
   ```bash
   source .venv/bin/activate
@@ -60,7 +64,7 @@ Instal _dependencies_ Python:
 
 ```bash
 pip install --upgrade pip
-pip install fastapi uvicorn python-multipart demucs faster-whisper
+pip install fastapi uvicorn python-multipart demucs faster-whisper yt-dlp librosa
 ```
 
 Jalankan _server_ backend:
@@ -69,7 +73,10 @@ Jalankan _server_ backend:
 uvicorn main:app --reload --port 8000
 ```
 
-> **Catatan:** Saat pertama kali memproses file, Demucs (`htdemucs` / `htdemucs_6s`) dan Faster-Whisper akan mengunduh bobot model AI ke _cache_ lokal. Proses ini membutuhkan koneksi internet di awal saja; setelah terunduh, pemrosesan berikutnya berjalan secara lokal.
+> **Catatan:**
+>
+> - Saat pertama kali memproses file, Demucs (`htdemucs` / `htdemucs_6s`) dan Faster-Whisper akan mengunduh bobot model AI ke _cache_ lokal. Proses ini membutuhkan internet di awal saja; setelah terunduh, pemrosesan file lokal dapat berjalan secara _offline_.
+> - Koneksi internet diperlukan jika menggunakan fitur input dari **Link YouTube** (`yt-dlp`).
 
 ### 3. Setup & Jalankan Frontend (Next.js)
 
@@ -112,5 +119,6 @@ vocal-remover-app/
 ## Troubleshooting Singkat
 
 - **Perintah `ffmpeg` tidak dikenali:** Pastikan FFmpeg sudah terpasang dan terminal dibuka ulang setelah instalasi.
+- **Unduh link YouTube gagal:** Perbarui `yt-dlp` ke versi terbaru dengan `pip install -U yt-dlp`.
 - **Proses terasa lambat:** Pemrosesan di CPU memakan waktu lebih lama dibanding GPU NVIDIA (CUDA). Kamu bisa mengganti model Whisper ke `"base"` atau `"tiny"` di `backend/main.py` untuk mempercepat transkripsi.
-- **Port 3000 atau 8000 sudah dipakai:** Jalankan Next.js dengan `npm run dev -- -p 3001` atau FastAPI dengan `--port 8001` (sesuaikan `API_URL` jika mengubah _port_ backend).
+- **Port 3000 atau 8000 sudah dipakai:** Jalankan Next.js dengan `npm run dev -- -p 3001` atau FastAPI dengan `--port 8001` (sesuaikan `API_URL` di `frontend/app/page.tsx` jika mengubah _port_ backend).
