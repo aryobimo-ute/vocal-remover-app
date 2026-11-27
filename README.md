@@ -3,7 +3,7 @@
 Aplikasi web lokal untuk:
 
 1. **Hapus Vokal & Subtitle:** Menghapus vokal dari file lokal maupun link YouTube menggunakan Demucs (`htdemucs`), membuat _subtitle_ `.srt` dari trek vokal menggunakan Faster-Whisper, dan menggabungkan _hardsub_ + audio instrumental dengan FFmpeg (atau memilih hasil audio `.mp3` saja).
-2. **Pisah Instrumen & Mixer:** Memisahkan 6 _stem_ (`drums`, `bass`, `guitar`, `piano`, `other`, `vocals`) menggunakan `htdemucs_6s` dari file lokal maupun link YouTube (video otomatis dikonversi ke audio), mendeteksi tempo (BPM) secara otomatis dengan `librosa`, memutarnya secara _real-time_ di _browser_ dengan kontrol volume, _panning_ kiri/kanan, _solo_, _mute_, _metronome_ (auto BPM / manual, volume, _panning_), serta _export_ hasil _mix_ ke `.wav`.
+2. **Pisah Instrumen & Mixer:** Memisahkan 6 _stem_ (`drums`, `bass`, `guitar`, `piano`, `other`, `vocals`) menggunakan `htdemucs_6s` dari file lokal maupun link YouTube (video otomatis dikonversi ke audio), mendeteksi tempo (BPM) secara otomatis dengan `librosa`, memutarnya secara _real-time_ di _browser_ dengan kontrol volume, _panning_ kiri/kanan, _solo_, _mute_, _metronome_ (auto BPM / manual, _tap BPM_, _beat grid sync_, volume, _panning_), timeline & kecepatan putar, serta _export_ hasil _mix_ ke `.wav`.
 
 ---
 
@@ -16,6 +16,7 @@ Aplikasi web lokal untuk:
    - **Windows (PowerShell):** `winget install Gyan.FFmpeg`
    - **macOS (Homebrew):** `brew install ffmpeg`
    - **Linux (Ubuntu/Debian):** `sudo apt update && sudo apt install -y ffmpeg`
+5. _(Opsional untuk akselerasi GPU NVIDIA)_ **Driver NVIDIA** terpasang dan terbaca lewat `nvidia-smi`.
 
 ---
 
@@ -60,12 +61,28 @@ Aktifkan `.venv`:
   source .venv/bin/activate
   ```
 
-Instal _dependencies_ Python:
+#### Pilih Salah Satu Cara Instalasi Dependencies Python Sesuai Perangkat:
 
-```bash
-pip install --upgrade pip
-pip install fastapi uvicorn python-multipart demucs faster-whisper yt-dlp librosa
-```
+- **Opsi A — PC / Laptop CPU saja atau perangkat non-NVIDIA:**
+
+  ```bash
+  pip install --upgrade pip
+  pip install fastapi uvicorn python-multipart demucs faster-whisper yt-dlp librosa
+  ```
+
+- **Opsi B — PC dengan GPU NVIDIA (Akselerasi CUDA):**
+  Cek dulu versi CUDA pada output `nvidia-smi`, lalu pasang PyTorch dengan _index URL_ CUDA yang sesuai (contoh di bawah menggunakan `cu124`; sesuaikan jika perlu):
+  ```bash
+  pip install --upgrade pip
+  pip uninstall -y torch torchaudio torchvision
+  pip install torch torchaudio --index-url [https://download.pytorch.org/whl/cu124](https://download.pytorch.org/whl/cu124)
+  pip install fastapi uvicorn python-multipart demucs faster-whisper yt-dlp librosa
+  ```
+  Verifikasi bahwa GPU terbaca oleh PyTorch:
+  ```bash
+  python -c "import torch; print('CUDA available:', torch.cuda.is_available(), '| GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
+  ```
+  _(Pastikan juga konfigurasi `WhisperModel` di `backend/main.py` menggunakan `device="cuda"` dan `compute_type="float16"` saat `torch.cuda.is_available()` bernilai `True`.)_
 
 Jalankan _server_ backend:
 
@@ -101,6 +118,7 @@ Buka aplikasi di _browser_ pada alamat:
 vocal-remover-app/
 ├── .gitignore
 ├── README.md
+├── AI_CONTEXT_GUIDE.md
 ├── backend/
 │   └── main.py
 └── frontend/
@@ -119,6 +137,8 @@ vocal-remover-app/
 ## Troubleshooting Singkat
 
 - **Perintah `ffmpeg` tidak dikenali:** Pastikan FFmpeg sudah terpasang dan terminal dibuka ulang setelah instalasi.
+- **GPU NVIDIA tidak terpakai (`CUDA available: False`):** Pastikan driver NVIDIA terpasang (`nvidia-smi` berhasil), PyTorch terinstal versi CUDA (bukan _wheel_ CPU saja), dan `WhisperModel` di `backend/main.py` diarahkan ke `"cuda"` saat GPU tersedia.
+- **VRAM GPU penuh / Out of Memory:** Gunakan model Whisper yang lebih ringan (misalnya `"small"` atau `"base"`) atau tutup aplikasi berat lain saat memproses file berdurasi panjang.
 - **Unduh link YouTube gagal:** Perbarui `yt-dlp` ke versi terbaru dengan `pip install -U yt-dlp`.
 - **Proses terasa lambat:** Pemrosesan di CPU memakan waktu lebih lama dibanding GPU NVIDIA (CUDA). Kamu bisa mengganti model Whisper ke `"base"` atau `"tiny"` di `backend/main.py` untuk mempercepat transkripsi.
 - **Port 3000 atau 8000 sudah dipakai:** Jalankan Next.js dengan `npm run dev -- -p 3001` atau FastAPI dengan `--port 8001` (sesuaikan `API_URL` di `frontend/app/page.tsx` jika mengubah _port_ backend).
