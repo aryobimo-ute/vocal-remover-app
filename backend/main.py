@@ -1,8 +1,10 @@
+import json
 import math
 import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -13,6 +15,7 @@ from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 import librosa
 import numpy as np
+import torch
 
 app = FastAPI()
 app.add_middleware(
@@ -24,15 +27,57 @@ app.add_middleware(
 
 BASE_DIR = Path(__file__).parent / "work"
 BASE_DIR.mkdir(exist_ok=True)
+LIBRARY_FILE = BASE_DIR / "stem_library.json"
+library_lock = threading.Lock()
 
-print("[INIT] Memuat model Faster-Whisper (small)...")
+whisper_device = "cuda" if torch.cuda.is_available() else "cpu"
+whisper_compute_type = "float16" if whisper_device == "cuda" else "int8"
+
+print(
+    f"[INIT] Memuat model Faster-Whisper (small) di {whisper_device.upper()} ({whisper_compute_type})..."
+)
 t_init = time.perf_counter()
-whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
+whisper_model = WhisperModel("small", device=whisper_device, compute_type=whisper_compute_type)
 print(f"[INIT] Model Faster-Whisper siap dalam {time.perf_counter() - t_init:.1f}s")
 
 STEMS_6S = ["drums", "bass", "guitar", "piano", "other", "vocals"]
 jobs: dict[str, dict] = {}
 PERCENT_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)%")
+
+
+def load_stem_library() -> list[dict]:
+    with library_lock:
+        if not LIBRARY_FILE.exists():
+            return []
+        try:
+            data = json.loads(LIBRARY_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+
+def save_stem_to_library(entry: dict):
+    with library_lock:
+        items = load_stem_library()
+        items = [x for x in items if x.get("job_id") != entry.get("job_id")]
+        items.insert(0, entry)
+        LIBRARY_FILE.write_text(
+            json.dumps(items, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+
+def remove_stem_from_library(job_id: str) -> bool:
+    with library_lock:
+        items = load_stem_library()
+        new_items = [x for x in items if x.get("job_id") != job_id]
+        if len(new_items) == len(items):
+            return False
+        LIBRARY_FILE.write_text(
+            json.dumps(new_items, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return True
 
 
 def log_step(job_id: str, step: str, message: str, progress: Optional[int] = None):
@@ -295,6 +340,16 @@ def execute_stem_job(job_id: str, input_path: Path, job_dir: Path):
             drum_bpm = detect_bpm(drums_wav, job_id, progress=96)
             jobs[job_id]["detected_bpm"] = drum_bpm
 
+        final_bpm = jobs[job_id].get("detected_bpm", 120)
+        library_entry = {
+            "job_id": job_id,
+            "title": jobs[job_id].get("source_label") or f"Track {job_id[:8]}",
+            "stems": available_stems,
+            "detected_bpm": final_bpm,
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        save_stem_to_library(library_entry)
+
         total_s = time.perf_counter() - total_start
         log_step(job_id, "DONE", f"Pemisahan stem selesai dalam {total_s:.1f}s", progress=100)
         jobs[job_id]["status"] = "completed"
@@ -411,15 +466,20 @@ async def separate_stems(
     job_dir.mkdir(parents=True, exist_ok=True)
 
     uploaded_path: Optional[Path] = None
+    source_label = f"Track {job_id[:8]}"
+
     if file and file.filename:
         ext = Path(file.filename).suffix.lower()
         allowed = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".mp4", ".mkv", ".mov", ".webm"}
         if ext not in allowed:
             raise HTTPException(status_code=400, detail="Format file tidak didukung.")
+        source_label = file.filename
         uploaded_path = job_dir / f"input{ext}"
         with open(uploaded_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
-    elif not (youtube_url and youtube_url.strip()):
+    elif youtube_url and youtube_url.strip():
+        source_label = youtube_url.strip()
+    else:
         raise HTTPException(status_code=400, detail="Wajib mengunggah file atau mengisi link YouTube.")
 
     jobs[job_id] = {
@@ -429,6 +489,7 @@ async def separate_stems(
         "message": "Menyiapkan pemisahan 6 stem...",
         "logs": [],
         "stems": [],
+        "source_label": source_label,
         "detected_bpm": 120,
         "result": None,
         "error": None,
@@ -436,6 +497,23 @@ async def separate_stems(
     log_step(job_id, "UPLOAD", "Job pemisahan stem masuk antrean.", progress=2)
     background_tasks.add_task(run_stem_wrapper, job_id, job_dir, uploaded_path, youtube_url)
     return {"job_id": job_id}
+
+
+@app.get("/stem-library")
+def get_stem_library():
+    return {"items": load_stem_library()}
+
+
+@app.delete("/stem-library/{job_id}")
+def delete_stem_library_item(job_id: str):
+    safe_id = os.path.basename(job_id)
+    removed = remove_stem_from_library(safe_id)
+    job_dir = BASE_DIR / safe_id
+    if job_dir.exists():
+        shutil.rmtree(job_dir, ignore_errors=True)
+    if not removed and not job_dir.exists():
+        raise HTTPException(status_code=404, detail="Item library tidak ditemukan.")
+    return {"deleted": True, "job_id": safe_id}
 
 
 @app.get("/status/{job_id}")

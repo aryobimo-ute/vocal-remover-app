@@ -3,7 +3,7 @@
 Aplikasi web lokal untuk:
 
 1. **Hapus Vokal & Subtitle:** Menghapus vokal dari file lokal maupun link YouTube menggunakan Demucs (`htdemucs`), membuat _subtitle_ `.srt` dari trek vokal menggunakan Faster-Whisper, dan menggabungkan _hardsub_ + audio instrumental dengan FFmpeg (atau memilih hasil audio `.mp3` saja).
-2. **Pisah Instrumen & Mixer:** Memisahkan 6 _stem_ (`drums`, `bass`, `guitar`, `piano`, `other`, `vocals`) menggunakan `htdemucs_6s` dari file lokal maupun link YouTube (video otomatis dikonversi ke audio), mendeteksi tempo (BPM) secara otomatis dengan `librosa`, memutarnya secara _real-time_ di _browser_ dengan kontrol volume, _panning_ kiri/kanan, _solo_, _mute_, _metronome_ (auto BPM / manual, _tap BPM_, _beat grid sync_, volume, _panning_), timeline & kecepatan putar, serta _export_ hasil _mix_ ke `.wav`.
+2. **Pisah Instrumen & Mixer:** Memisahkan 6 _stem_ (`drums`, `bass`, `guitar`, `piano`, `other`, `vocals`) menggunakan `htdemucs_6s` dari file lokal maupun link YouTube (video otomatis dikonversi ke audio), menyimpan hasilnya ke **Library Lagu Terpisah** (`backend/work/stem_library.json`) agar bisa dibuka kembali di _mixer_ tanpa memproses ulang, mendeteksi tempo (BPM) secara otomatis dengan `librosa`, memutarnya secara _real-time_ di _browser_ dengan kontrol volume, _panning_ kiri/kanan, _solo_, _mute_, _metronome_ (auto BPM / manual, _tap BPM_, _beat grid sync_, volume, _panning_), timeline & kecepatan putar, serta _export_ hasil _mix_ ke `.wav`.
 
 ---
 
@@ -120,8 +120,12 @@ vocal-remover-app/
 ├── README.md
 ├── AI_CONTEXT_GUIDE.md
 ├── backend/
+│   ├── .venv/                   # Diabaikan di Git
+│   ├── work/                    # File sementara job, output & stem_library.json (diabaikan di Git)
 │   └── main.py
 └── frontend/
+    ├── node_modules/            # Diabaikan di Git
+    ├── .next/                   # Diabaikan di Git
     ├── package.json
     └── app/
         ├── layout.tsx
