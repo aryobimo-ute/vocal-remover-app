@@ -289,29 +289,26 @@ def _fit_constant_grid(
     return best_bpm, float(np.mod(phase, period)), best_score
 
 
-def analyze_bpm_and_beat_offset(
+def _analyze_tempo_grid_or_none(
     audio_path: Path,
-    job_id: str,
-    progress: Optional[int] = None,
     fallback_bpm: float = 120.0,
     hint_bpm: Optional[float] = None,
-) -> tuple[float, float]:
-    """Deteksi BPM desimal (akurat 0.01) + offset ketukan (detik) untuk grid metronome.
+) -> Optional[tuple[float, float, float]]:
+    """Inti analisis. Mengembalikan (bpm, offset_detik, skor) atau None bila gagal/tidak yakin.
 
-    - BPM TIDAK lagi dibulatkan ke bilangan bulat (penyebab utama metronome 'lari' di tengah/akhir lagu).
-    - Fase dicari dari hentakan kick/snare (band <= 2.5 kHz) sepanjang lagu, bukan dari beat-tracker saja.
-    - hint_bpm menjaga oktaf tempo (mis. 70 vs 140) agar konsisten dengan hasil sebelumnya.
+    - BPM desimal (akurasi 0.01), fase dari hentakan kick/snare (band <= 2.5 kHz).
+    - hint_bpm HANYA dipakai untuk menjaga oktaf tempo (mis. 70 vs 140).
     """
     try:
         y, sr = librosa.load(str(audio_path), sr=ANALYSIS_SR, mono=True)
         if y.size == 0:
-            return float(fallback_bpm), 0.0
+            return None
 
         env = librosa.onset.onset_strength(
             y=y, sr=sr, hop_length=ANALYSIS_HOP, n_fft=1024, fmax=2500
         )
         if env.size < 50 or not np.isfinite(env).all() or float(env.max()) <= 0:
-            return float(fallback_bpm), 0.0
+            return None
 
         start_bpm = float(hint_bpm or fallback_bpm or 120.0)
         tempo, _ = librosa.beat.beat_track(
@@ -329,7 +326,7 @@ def analyze_bpm_and_beat_offset(
         while est > 200.0:
             est /= 2.0
 
-        # Pertahankan oktaf yang sama dengan hint (BPM lama / hasil mix) bila berselisih 2x
+        # Pertahankan oktaf yang sama dengan hint bila berselisih 2x
         if hint_bpm:
             est = min((est / 2.0, est, est * 2.0), key=lambda c: abs(c / float(hint_bpm) - 1.0))
             if abs(est / float(hint_bpm) - 1.0) > 0.12:
@@ -339,27 +336,88 @@ def analyze_bpm_and_beat_offset(
         weights = np.clip(env - np.percentile(env, 70), 0.0, None) ** 2
         keep = weights > 0
         if int(keep.sum()) < 20:
-            return float(fallback_bpm), 0.0
+            return None
 
         bpm, offset, score = _fit_constant_grid(times[keep], weights[keep], est)
+        if not (math.isfinite(bpm) and math.isfinite(offset) and math.isfinite(score)):
+            return None
         bpm = round(float(max(40.0, min(240.0, bpm))), 2)
-        offset = round(float(offset), 3)
-
-        log_step(
-            job_id,
-            "BPM",
-            f"Tempo & sinkronisasi drum: {bpm:.2f} BPM (offset ketukan {offset:.3f}s, skor {score:.2f})",
-            progress=progress,
-        )
-        return bpm, offset
+        return bpm, round(float(offset), 3), float(score)
     except Exception as exc:
+        print(f"[BPM] analisis {Path(audio_path).name} gagal: {exc}", flush=True)
+        return None
+
+
+def analyze_bpm_and_beat_offset(
+    audio_path: Path,
+    job_id: str,
+    progress: Optional[int] = None,
+    fallback_bpm: float = 120.0,
+    hint_bpm: Optional[float] = None,
+) -> tuple[float, float]:
+    """Versi sederhana: selalu mengembalikan (bpm, offset); fallback bila analisis gagal."""
+    result = _analyze_tempo_grid_or_none(audio_path, fallback_bpm, hint_bpm)
+    if result is None:
         log_step(
             job_id,
             "BPM",
-            f"Gagal deteksi BPM/sinkron otomatis ({exc}), default {fallback_bpm} BPM / 0.00s",
+            f"Gagal deteksi BPM/sinkron otomatis, default {fallback_bpm} BPM / 0.00s",
             progress=progress,
         )
         return float(fallback_bpm), 0.0
+    bpm, offset, score = result
+    log_step(
+        job_id,
+        "BPM",
+        f"Tempo & sinkronisasi: {bpm:.2f} BPM (offset ketukan {offset:.3f}s, skor {score:.2f})",
+        progress=progress,
+    )
+    return bpm, offset
+
+
+def best_grid_for_job(
+    job_id: str,
+    job_dir: Path,
+    hint_bpm: Optional[float] = None,
+    fallback_bpm: float = 120.0,
+    progress: Optional[int] = None,
+) -> Optional[tuple[float, float]]:
+    """Dipakai SAMA PERSIS oleh lagu baru (saat pemisahan) dan tombol 'Deteksi Ulang'.
+
+    Menganalisis stem drum dan mix asli, lalu memilih grid yang paling cocok.
+    Mengembalikan None bila semua gagal (pemanggil harus mempertahankan nilai lama).
+    """
+    drums_wav = job_dir / "demucs_out" / "htdemucs_6s" / "source" / "drums.wav"
+    mix_wav = job_dir / "source.wav"
+
+    candidates: list[tuple[float, str, tuple[float, float, float]]] = []
+
+    ref_bpm = hint_bpm
+    if drums_wav.exists():
+        res = _analyze_tempo_grid_or_none(drums_wav, fallback_bpm, hint_bpm)
+        if res:
+            # Stem drum lebih bersih -> diberi bonus 15%
+            candidates.append((res[2] * 1.15, "drum", res))
+            ref_bpm = res[0]
+
+    if mix_wav.exists():
+        # Oktaf mix mengikuti oktaf drum agar skor keduanya sebanding
+        res = _analyze_tempo_grid_or_none(mix_wav, fallback_bpm, ref_bpm)
+        if res:
+            candidates.append((res[2], "mix", res))
+
+    if not candidates:
+        log_step(job_id, "BPM", "Semua analisis beat gagal; nilai sinkron lama dipertahankan.", progress=progress)
+        return None
+
+    _, label, (bpm, offset, score) = max(candidates, key=lambda c: c[0])
+    log_step(
+        job_id,
+        "BPM",
+        f"Tempo & sinkronisasi ({label}): {bpm:.2f} BPM (offset ketukan {offset:.3f}s, skor {score:.2f})",
+        progress=progress,
+    )
+    return bpm, offset
 
 
 def format_srt_time(seconds: float) -> str:
@@ -495,11 +553,9 @@ def execute_stem_job(job_id: str, input_path: Path, job_dir: Path):
             end_pct=22,
         )
 
-        initial_bpm, initial_offset = analyze_bpm_and_beat_offset(
-            wav_path, job_id, progress=25, fallback_bpm=120
-        )
-        jobs[job_id]["detected_bpm"] = initial_bpm
-        jobs[job_id]["beat_offset_sec"] = initial_offset
+        # Nilai awal sementara; hasil akhir dihitung setelah stem drum tersedia
+        jobs[job_id]["detected_bpm"] = 120.0
+        jobs[job_id]["beat_offset_sec"] = 0.0
 
         demucs_out = job_dir / "demucs_out"
         run_cmd_with_log(
@@ -514,13 +570,13 @@ def execute_stem_job(job_id: str, input_path: Path, job_dir: Path):
         stem_dir = demucs_out / "htdemucs_6s" / "source"
         available_stems = [s for s in STEMS_6S if (stem_dir / f"{s}.wav").exists()]
 
-        drums_wav = stem_dir / "drums.wav"
-        if drums_wav.exists():
-            drum_bpm, drum_offset = analyze_bpm_and_beat_offset(
-                drums_wav, job_id, progress=96, fallback_bpm=initial_bpm, hint_bpm=initial_bpm
-            )
-            jobs[job_id]["detected_bpm"] = drum_bpm
-            jobs[job_id]["beat_offset_sec"] = drum_offset
+        try:
+            grid = best_grid_for_job(job_id, job_dir, progress=96)
+        except Exception as bpm_exc:
+            grid = None
+            log_step(job_id, "BPM", f"Analisis beat error ({bpm_exc}); memakai default 120 BPM.", progress=96)
+        if grid is not None:
+            jobs[job_id]["detected_bpm"], jobs[job_id]["beat_offset_sec"] = grid
 
         final_bpm = jobs[job_id].get("detected_bpm", 120)
         final_offset = jobs[job_id].get("beat_offset_sec", 0.0)
@@ -727,19 +783,19 @@ def reanalyze_stem_library_item(job_id: str, only_if_outdated: bool = False):
         return {"skipped": True, "item": item}
 
     job_dir = BASE_DIR / safe_id
-    drums_wav = job_dir / "demucs_out" / "htdemucs_6s" / "source" / "drums.wav"
-    source_wav = job_dir / "source.wav"
-    target = drums_wav if drums_wav.exists() else source_wav
-    if not target.exists():
-        raise HTTPException(status_code=404, detail="File audio untuk analisis tidak ditemukan.")
+    if not job_dir.exists():
+        raise HTTPException(status_code=404, detail="Folder lagu tidak ditemukan.")
 
     old_bpm = item.get("detected_bpm")
-    bpm, offset = analyze_bpm_and_beat_offset(
-        target,
+    grid = best_grid_for_job(
         safe_id,
-        fallback_bpm=float(old_bpm or 120.0),
+        job_dir,
         hint_bpm=float(old_bpm) if old_bpm else None,
+        fallback_bpm=float(old_bpm or 120.0),
     )
+    if grid is None:
+        raise HTTPException(status_code=500, detail="Analisis beat gagal; nilai lama dipertahankan.")
+    bpm, offset = grid
     updated = update_stem_in_library(
         safe_id,
         beat_offset_sec=offset,
