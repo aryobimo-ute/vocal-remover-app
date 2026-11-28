@@ -45,11 +45,16 @@ STEMS_6S = ["drums", "bass", "guitar", "piano", "other", "vocals"]
 jobs: dict[str, dict] = {}
 PERCENT_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)%")
 
+# Versi algoritma sinkron beat. v1 = BPM dibulatkan integer (kurang akurat), v2 = BPM desimal + fit grid.
+ANALYSIS_VERSION = 2
+ANALYSIS_SR = 22050
+ANALYSIS_HOP = 128
+
 
 class LibraryUpdateRequest(BaseModel):
     title: Optional[str] = None
     beat_offset_sec: Optional[float] = None
-    detected_bpm: Optional[int] = None
+    detected_bpm: Optional[float] = None
 
 
 def _read_library_unlocked() -> list[dict]:
@@ -87,7 +92,8 @@ def update_stem_in_library(
     job_id: str,
     new_title: Optional[str] = None,
     beat_offset_sec: Optional[float] = None,
-    detected_bpm: Optional[int] = None,
+    detected_bpm: Optional[float] = None,
+    analysis_version: Optional[int] = None,
 ) -> Optional[dict]:
     with library_lock:
         items = _read_library_unlocked()
@@ -98,8 +104,14 @@ def update_stem_in_library(
                     item["title"] = new_title
                 if beat_offset_sec is not None and math.isfinite(beat_offset_sec):
                     item["beat_offset_sec"] = round(float(beat_offset_sec), 3)
-                if detected_bpm is not None:
-                    item["detected_bpm"] = int(max(40, min(240, detected_bpm)))
+                if detected_bpm is not None and math.isfinite(detected_bpm):
+                    item["detected_bpm"] = round(float(max(40.0, min(240.0, detected_bpm))), 2)
+                # Setiap penulisan sinkron (otomatis maupun manual dari user) dianggap versi terbaru
+                # supaya setelan manual user tidak ditimpa deteksi ulang otomatis.
+                if analysis_version is not None:
+                    item["analysis_version"] = int(analysis_version)
+                elif beat_offset_sec is not None or detected_bpm is not None:
+                    item["analysis_version"] = ANALYSIS_VERSION
                 if "beat_offset_sec" not in item:
                     item["beat_offset_sec"] = 0.0
                 updated_item = item
@@ -218,78 +230,128 @@ def download_from_youtube(job_id: str, url: str, job_dir: Path, prefer_audio_onl
     return downloaded, is_video
 
 
+def _fold_phase_score(
+    times: "np.ndarray",
+    weights: "np.ndarray",
+    period: float,
+    bin_s: float = 0.004,
+) -> tuple[float, float]:
+    """Lipat waktu onset ke dalam satu periode ketukan, lalu ukur seberapa 'menumpuk' di satu fase.
+
+    Skor tinggi = grid (BPM + fase) cocok dengan hentakan drum sepanjang lagu.
+    Mengembalikan (skor, fase_detik).
+    """
+    nb = max(24, int(round(period / bin_s)))
+    idx = np.minimum(((np.mod(times, period) / period) * nb).astype(np.int64), nb - 1)
+    hist = np.bincount(idx, weights=weights, minlength=nb).astype(np.float64)
+    kernel = np.array([1.0, 2.0, 3.0, 2.0, 1.0])
+    kernel /= kernel.sum()
+    padded = np.concatenate([hist[-2:], hist, hist[:2]])
+    smooth = np.convolve(padded, kernel, mode="valid")
+    best = int(np.argmax(smooth))
+    total = float(smooth.sum())
+    if total <= 0:
+        return 0.0, 0.0
+    score = float(smooth[best]) * nb / total
+    return score, (best + 0.5) / nb * period
+
+
+def _fit_constant_grid(
+    times: "np.ndarray",
+    weights: "np.ndarray",
+    bpm_center: float,
+    span: float = 0.04,
+    step: float = 0.01,
+) -> tuple[float, float, float]:
+    """Cari BPM (resolusi 0.01) + fase terbaik untuk grid tempo konstan.
+
+    Resolusi 0.01 BPM penting: selisih 0.4 BPM saja sudah membuat metronome
+    meleset hampir 1 detik di akhir lagu 4 menit.
+    Mengembalikan (bpm, offset_detik, skor).
+    """
+    lo = max(40.0, bpm_center * (1.0 - span))
+    hi = min(240.0, bpm_center * (1.0 + span))
+    best_score, best_bpm, best_phase = -1.0, bpm_center, 0.0
+    for bpm in np.arange(lo, hi + step, step):
+        period = 60.0 / float(bpm)
+        score, phase = _fold_phase_score(times, weights, period)
+        if score > best_score:
+            best_score, best_bpm, best_phase = score, float(bpm), phase
+
+    # Haluskan fase memakai rata-rata berbobot dari selisih onset terhadap grid
+    period = 60.0 / best_bpm
+    phase = best_phase
+    for _ in range(2):
+        resid = np.mod(times - phase + period / 2.0, period) - period / 2.0
+        near = np.abs(resid) < period * 0.12
+        if near.any() and float(weights[near].sum()) > 0:
+            phase += float(np.average(resid[near], weights=weights[near]))
+    return best_bpm, float(np.mod(phase, period)), best_score
+
+
 def analyze_bpm_and_beat_offset(
     audio_path: Path,
     job_id: str,
     progress: Optional[int] = None,
-    fallback_bpm: int = 120,
-) -> tuple[int, float]:
-    """Mendeteksi BPM serta fase offset ketukan (detik) agar selaras dengan ketukan drum."""
+    fallback_bpm: float = 120.0,
+    hint_bpm: Optional[float] = None,
+) -> tuple[float, float]:
+    """Deteksi BPM desimal (akurat 0.01) + offset ketukan (detik) untuk grid metronome.
+
+    - BPM TIDAK lagi dibulatkan ke bilangan bulat (penyebab utama metronome 'lari' di tengah/akhir lagu).
+    - Fase dicari dari hentakan kick/snare (band <= 2.5 kHz) sepanjang lagu, bukan dari beat-tracker saja.
+    - hint_bpm menjaga oktaf tempo (mis. 70 vs 140) agar konsisten dengan hasil sebelumnya.
+    """
     try:
-        y, sr = librosa.load(str(audio_path), sr=22050, mono=True)
+        y, sr = librosa.load(str(audio_path), sr=ANALYSIS_SR, mono=True)
         if y.size == 0:
-            return fallback_bpm, 0.0
+            return float(fallback_bpm), 0.0
 
-        onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-        tempo, beat_frames = librosa.beat.beat_track(
-            y=y,
-            sr=sr,
-            onset_envelope=onset_env,
-            units="frames",
+        env = librosa.onset.onset_strength(
+            y=y, sr=sr, hop_length=ANALYSIS_HOP, n_fft=1024, fmax=2500
         )
+        if env.size < 50 or not np.isfinite(env).all() or float(env.max()) <= 0:
+            return float(fallback_bpm), 0.0
 
-        raw_bpm = float(np.asarray(tempo).reshape(-1)[0])
-        beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+        start_bpm = float(hint_bpm or fallback_bpm or 120.0)
+        tempo, _ = librosa.beat.beat_track(
+            onset_envelope=env,
+            sr=sr,
+            hop_length=ANALYSIS_HOP,
+            start_bpm=start_bpm,
+            tightness=100,
+        )
+        est = float(np.asarray(tempo).reshape(-1)[0])
+        if not math.isfinite(est) or est <= 0:
+            est = start_bpm
+        while est < 60.0:
+            est *= 2.0
+        while est > 200.0:
+            est /= 2.0
 
-        # Jika interval antar beat konsisten, gunakan median interval sebagai BPM yang lebih stabil
-        if len(beat_times) >= 4:
-            diffs = np.diff(beat_times)
-            valid_diffs = diffs[(diffs > 0.2) & (diffs < 1.6)]
-            if valid_diffs.size >= 3:
-                median_period = float(np.median(valid_diffs))
-                interval_bpm = 60.0 / median_period
-                if 40.0 <= interval_bpm <= 240.0:
-                    raw_bpm = interval_bpm
+        # Pertahankan oktaf yang sama dengan hint (BPM lama / hasil mix) bila berselisih 2x
+        if hint_bpm:
+            est = min((est / 2.0, est, est * 2.0), key=lambda c: abs(c / float(hint_bpm) - 1.0))
+            if abs(est / float(hint_bpm) - 1.0) > 0.12:
+                est = float(hint_bpm)
 
-        if math.isnan(raw_bpm) or raw_bpm <= 0:
-            bpm_int = fallback_bpm
-        else:
-            bpm_int = int(max(40, min(240, round(raw_bpm))))
+        times = np.arange(env.size) * ANALYSIS_HOP / float(sr)
+        weights = np.clip(env - np.percentile(env, 70), 0.0, None) ** 2
+        keep = weights > 0
+        if int(keep.sum()) < 20:
+            return float(fallback_bpm), 0.0
 
-        beat_period = 60.0 / float(bpm_int)
-        beat_offset_sec = 0.0
-
-        if len(beat_times) > 0:
-            # Cari fase ketukan (mod beat_period) yang paling sering muncul di beat_times
-            phases = np.mod(beat_times, beat_period)
-            # Gunakan circular mean / histogram binning pada [0, beat_period)
-            num_bins = 72
-            hist, bin_edges = np.histogram(phases, bins=num_bins, range=(0.0, beat_period))
-            best_bin = int(np.argmax(hist))
-            in_bin = phases[(phases >= bin_edges[best_bin]) & (phases <= bin_edges[best_bin + 1])]
-            if in_bin.size > 0:
-                phase_sec = float(np.mean(in_bin))
-            else:
-                phase_sec = float(phases[0])
-
-            # Haluskan lagi dengan puncak onset terdekat di sekitar fase awal
-            search_window = min(0.08, beat_period * 0.2)
-            onset_times = librosa.times_like(onset_env, sr=sr)
-            if onset_times.size > 0 and onset_env.size > 0:
-                # Cari transient kuat pertama atau sesuaikan ke beat_times[0] jika sangat dekat
-                first_beat = float(beat_times[0])
-                if abs(((first_beat - phase_sec + beat_period / 2) % beat_period) - beat_period / 2) <= search_window:
-                    phase_sec = float(first_beat % beat_period)
-
-            beat_offset_sec = round(phase_sec % beat_period, 3)
+        bpm, offset, score = _fit_constant_grid(times[keep], weights[keep], est)
+        bpm = round(float(max(40.0, min(240.0, bpm))), 2)
+        offset = round(float(offset), 3)
 
         log_step(
             job_id,
             "BPM",
-            f"Tempo & sinkronisasi drum: {bpm_int} BPM (offset ketukan {beat_offset_sec:.2f}s)",
+            f"Tempo & sinkronisasi drum: {bpm:.2f} BPM (offset ketukan {offset:.3f}s, skor {score:.2f})",
             progress=progress,
         )
-        return bpm_int, beat_offset_sec
+        return bpm, offset
     except Exception as exc:
         log_step(
             job_id,
@@ -297,7 +359,7 @@ def analyze_bpm_and_beat_offset(
             f"Gagal deteksi BPM/sinkron otomatis ({exc}), default {fallback_bpm} BPM / 0.00s",
             progress=progress,
         )
-        return fallback_bpm, 0.0
+        return float(fallback_bpm), 0.0
 
 
 def format_srt_time(seconds: float) -> str:
@@ -455,7 +517,7 @@ def execute_stem_job(job_id: str, input_path: Path, job_dir: Path):
         drums_wav = stem_dir / "drums.wav"
         if drums_wav.exists():
             drum_bpm, drum_offset = analyze_bpm_and_beat_offset(
-                drums_wav, job_id, progress=96, fallback_bpm=initial_bpm
+                drums_wav, job_id, progress=96, fallback_bpm=initial_bpm, hint_bpm=initial_bpm
             )
             jobs[job_id]["detected_bpm"] = drum_bpm
             jobs[job_id]["beat_offset_sec"] = drum_offset
@@ -468,6 +530,7 @@ def execute_stem_job(job_id: str, input_path: Path, job_dir: Path):
             "stems": available_stems,
             "detected_bpm": final_bpm,
             "beat_offset_sec": final_offset,
+            "analysis_version": ANALYSIS_VERSION,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
 
@@ -650,6 +713,42 @@ def update_stem_library_item(job_id: str, payload: LibraryUpdateRequest):
     if not updated:
         raise HTTPException(status_code=404, detail="Item library tidak ditemukan.")
     return {"updated": True, "item": updated}
+
+
+@app.post("/stem-library/{job_id}/reanalyze")
+def reanalyze_stem_library_item(job_id: str, only_if_outdated: bool = False):
+    """Hitung ulang BPM desimal + offset beat dari stem drum (tanpa memisah ulang stem)."""
+    safe_id = os.path.basename(job_id)
+    item = next((x for x in load_stem_library() if x.get("job_id") == safe_id), None)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Item library tidak ditemukan.")
+
+    if only_if_outdated and int(item.get("analysis_version", 1)) >= ANALYSIS_VERSION:
+        return {"skipped": True, "item": item}
+
+    job_dir = BASE_DIR / safe_id
+    drums_wav = job_dir / "demucs_out" / "htdemucs_6s" / "source" / "drums.wav"
+    source_wav = job_dir / "source.wav"
+    target = drums_wav if drums_wav.exists() else source_wav
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="File audio untuk analisis tidak ditemukan.")
+
+    old_bpm = item.get("detected_bpm")
+    bpm, offset = analyze_bpm_and_beat_offset(
+        target,
+        safe_id,
+        fallback_bpm=float(old_bpm or 120.0),
+        hint_bpm=float(old_bpm) if old_bpm else None,
+    )
+    updated = update_stem_in_library(
+        safe_id,
+        beat_offset_sec=offset,
+        detected_bpm=bpm,
+        analysis_version=ANALYSIS_VERSION,
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Item library tidak ditemukan.")
+    return {"skipped": False, "item": updated}
 
 
 @app.delete("/stem-library/{job_id}")

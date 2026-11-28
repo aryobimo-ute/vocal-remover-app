@@ -48,6 +48,89 @@ function createInitialTracks(): Record<StemName, TrackControl> {
   };
 }
 
+const ONSET_HOP = 256;
+// Toleransi: klik pertama boleh sedikit mendahului bunyi pertama lagu (dalam satuan ketukan)
+const GATE_TOLERANCE_BEATS = 0.12;
+
+type OnsetData = { env: Float32Array; hopSec: number; peak: number };
+
+function mod(n: number, m: number): number {
+  return ((n % m) + m) % m;
+}
+
+// Deteksi detik pertama lagu benar-benar berbunyi (melewati hening / intro kosong)
+function detectMusicStartSec(buffers: AudioBuffer[]): number {
+  if (buffers.length === 0) return 0;
+  const sr = buffers[0].sampleRate;
+  const block = Math.max(1, Math.floor(sr * 0.02));
+  const maxLen = Math.max(...buffers.map((b) => b.length));
+  const nBlocks = Math.floor(maxLen / block);
+  if (nBlocks <= 0) return 0;
+
+  const power = new Float64Array(nBlocks);
+  for (const buf of buffers) {
+    const ch = buf.getChannelData(0);
+    for (let b = 0; b < nBlocks; b++) {
+      const s = b * block;
+      const e = Math.min(ch.length, s + block);
+      let sum = 0;
+      let cnt = 0;
+      for (let i = s; i < e; i += 4) {
+        sum += ch[i] * ch[i];
+        cnt++;
+      }
+      if (cnt > 0) power[b] += sum / cnt;
+    }
+  }
+
+  const rms = Array.from(power, (p) => Math.sqrt(p));
+  const sorted = [...rms].sort((a, b) => a - b);
+  const p95 = sorted[Math.floor(sorted.length * 0.95)] ?? 0;
+  const threshold = Math.max(0.0015, p95 * 0.03);
+  for (let b = 0; b < rms.length; b++) {
+    if (rms[b] >= threshold) return (b * block) / sr;
+  }
+  return 0;
+}
+
+// Envelope onset sederhana (kenaikan energi) dari stem drum untuk "snap" ke hentakan asli
+function computeOnsetEnvelope(buffer: AudioBuffer): OnsetData {
+  const ch = buffer.getChannelData(0);
+  const n = Math.floor(ch.length / ONSET_HOP);
+  const energy = new Float32Array(n);
+  for (let f = 0; f < n; f++) {
+    let sum = 0;
+    const s = f * ONSET_HOP;
+    for (let i = s; i < s + ONSET_HOP; i++) sum += ch[i] * ch[i];
+    energy[f] = Math.sqrt(sum / ONSET_HOP);
+  }
+  const env = new Float32Array(n);
+  for (let f = 1; f < n; f++) env[f] = Math.max(0, energy[f] - energy[f - 1]);
+  const sorted = Float32Array.from(env).sort();
+  const peak = sorted[Math.floor(sorted.length * 0.99)] ?? 0;
+  return { env, hopSec: ONSET_HOP / buffer.sampleRate, peak };
+}
+
+function snapToOnset(
+  data: OnsetData | null,
+  loSec: number,
+  hiSec: number,
+): number | null {
+  if (!data || data.env.length === 0) return null;
+  const lo = Math.max(0, Math.floor(loSec / data.hopSec));
+  const hi = Math.min(data.env.length - 1, Math.ceil(hiSec / data.hopSec));
+  let best = -1;
+  let bestVal = 0;
+  for (let i = lo; i <= hi; i++) {
+    if (data.env[i] > bestVal) {
+      bestVal = data.env[i];
+      best = i;
+    }
+  }
+  if (best < 0 || bestVal < data.peak * 0.12) return null;
+  return best * data.hopSec;
+}
+
 function audioBufferToWavBlob(buffer: AudioBuffer): Blob {
   const numChannels = buffer.numberOfChannels;
   const sampleRate = buffer.sampleRate;
@@ -139,6 +222,19 @@ export default function StemMixer({
   const [metroPan, setMetroPan] = useState(0);
   const [exporting, setExporting] = useState(false);
 
+  // Metronome baru mulai saat lagu masuk (bukan dari detik 0 / saat hening)
+  const [gateEnabled, setGateEnabled] = useState(true);
+  const [musicStartAuto, setMusicStartAuto] = useState(0);
+  const [customStart, setCustomStart] = useState<number | null>(null);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analyzeMsg, setAnalyzeMsg] = useState<string | null>(null);
+
+  const gateRef = useRef<number | null>(null);
+  const onsetRef = useRef<OnsetData | null>(null);
+  const playTokenRef = useRef<number>(0);
+  const autoAnalyzedRef = useRef<string | null>(null);
+  const onSyncRef = useRef(onSyncChange);
+
   const syncedSeedKeyRef = useRef<string>(
     `${jobId}|${initialBpm}|${initialBeatOffset}`,
   );
@@ -179,6 +275,14 @@ export default function StemMixer({
   const anchorSongTimeRef = useRef<number>(0);
   const currentSongPosRef = useRef<number>(0);
   const isPlayingRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    onSyncRef.current = onSyncChange;
+  }, [onSyncChange]);
+
+  useEffect(() => {
+    gateRef.current = gateEnabled ? (customStart ?? musicStartAuto) : null;
+  }, [gateEnabled, customStart, musicStartAuto]);
 
   useEffect(() => {
     bpmRef.current = bpm;
@@ -279,13 +383,12 @@ export default function StemMixer({
   }, []);
 
   const scheduleMetronomeClickAtCtxTime = useCallback(
-    (ctxTime: number, beatIndex: number) => {
+    (ctxTime: number, isDownbeat: boolean) => {
       const ctx = ctxRef.current;
       if (!ctx || !metroGainRef.current) return;
       if (ctxTime < ctx.currentTime - 0.005) return;
 
       const safeStart = Math.max(ctx.currentTime, ctxTime);
-      const isDownbeat = ((beatIndex % 4) + 4) % 4 === 0;
       const osc = ctx.createOscillator();
       const clickGain = ctx.createGain();
       osc.type = "triangle";
@@ -353,28 +456,39 @@ export default function StemMixer({
         const elapsedAudioSec =
           (currentCtx.currentTime - anchorCtxTimeRef.current) * activeRate;
         const nowSongSec = anchorSongTimeRef.current + elapsedAudioSec;
-        const lookaheadSongSec = nowSongSec + 0.09 * activeRate;
+        const lookaheadSongSec = nowSongSec + 0.2 * activeRate;
+
+        // Ketukan pertama yang boleh berbunyi = ketukan grid pertama saat lagu masuk
+        const gate = gateRef.current;
+        const startIdx =
+          gate === null
+            ? Number.NEGATIVE_INFINITY
+            : Math.ceil(
+                (gate - activeOffset) / activeBeatSec - GATE_TOLERANCE_BEATS,
+              );
 
         while (true) {
-          const beatSongTime =
-            activeOffset + nextBeatIndexRef.current * activeBeatSec;
+          const idx = nextBeatIndexRef.current;
+          const beatSongTime = activeOffset + idx * activeBeatSec;
           if (beatSongTime > lookaheadSongSec) break;
 
-          if (beatSongTime >= nowSongSec - 0.015 * activeRate) {
+          if (
+            idx >= startIdx &&
+            beatSongTime >= nowSongSec - 0.015 * activeRate
+          ) {
             const deltaSongSec = beatSongTime - anchorSongTimeRef.current;
             const targetCtxTime =
               anchorCtxTimeRef.current + deltaSongSec / activeRate;
-            scheduleMetronomeClickAtCtxTime(
-              targetCtxTime,
-              nextBeatIndexRef.current,
-            );
+            // Hitungan 1-2-3-4 dimulai dari ketukan pertama lagu
+            const rel = gate === null ? idx : idx - startIdx;
+            scheduleMetronomeClickAtCtxTime(targetCtxTime, mod(rel, 4) === 0);
           }
           nextBeatIndexRef.current += 1;
         }
       };
 
       pumpClicks();
-      metroTimerRef.current = window.setInterval(pumpClicks, 18);
+      metroTimerRef.current = window.setInterval(pumpClicks, 25);
     },
     [clearScheduledClicks, scheduleMetronomeClickAtCtxTime],
   );
@@ -409,11 +523,16 @@ export default function StemMixer({
       if (loadingStems || duration <= 0) return;
       const clampedOffset = Math.max(0, Math.min(duration, offsetSec));
 
+      // Token: bila ada seek/ganti kecepatan beruntun, hanya permintaan terakhir yang boleh jalan
+      // (mencegah dua AudioContext hidup bersamaan -> audio dobel & metronome terasa tidak sinkron)
+      const token = ++playTokenRef.current;
+
       stopAudioNodes();
       if (ctxRef.current) {
         await ctxRef.current.close().catch(() => {});
         ctxRef.current = null;
       }
+      if (token !== playTokenRef.current) return;
 
       if (clampedOffset >= duration) {
         currentSongPosRef.current = 0;
@@ -423,6 +542,14 @@ export default function StemMixer({
       }
 
       const ctx = new AudioContext();
+      // Pastikan jam audio benar-benar berjalan sebelum mengunci titik anchor
+      if (ctx.state === "suspended") {
+        await ctx.resume().catch(() => {});
+      }
+      if (token !== playTokenRef.current) {
+        ctx.close().catch(() => {});
+        return;
+      }
       ctxRef.current = ctx;
 
       // Master bus khusus 6 stem (terpisah dari metronome)
@@ -446,7 +573,7 @@ export default function StemMixer({
       const currentTracks = tracksRef.current;
       const hasSolo = stems.some((s) => currentTracks[s]?.solo);
 
-      const startCtxTime = ctx.currentTime + 0.02;
+      const startCtxTime = ctx.currentTime + 0.05;
       anchorCtxTimeRef.current = startCtxTime;
       anchorSongTimeRef.current = clampedOffset;
       currentSongPosRef.current = clampedOffset;
@@ -541,6 +668,14 @@ export default function StemMixer({
         }
 
         if (!cancelled) {
+          const loadedList = Object.values(loaded).filter(
+            (b): b is AudioBuffer => Boolean(b),
+          );
+          const onsetSource = loaded.drums ?? loadedList[0];
+          onsetRef.current = onsetSource
+            ? computeOnsetEnvelope(onsetSource)
+            : null;
+          setMusicStartAuto(detectMusicStartSec(loadedList));
           setBuffers(loaded);
           setDuration(maxDur);
           setCurrentTime(0);
@@ -599,6 +734,7 @@ export default function StemMixer({
 
   async function handlePause() {
     if (!isPlayingRef.current || !ctxRef.current) return;
+    playTokenRef.current += 1;
     const pausedAt = Math.min(duration, getCurrentSongPos());
     currentSongPosRef.current = pausedAt;
     setCurrentTime(pausedAt);
@@ -609,6 +745,7 @@ export default function StemMixer({
   }
 
   async function handleStop() {
+    playTokenRef.current += 1;
     stopAudioNodes();
     if (ctxRef.current) {
       await ctxRef.current.close().catch(() => {});
@@ -643,14 +780,27 @@ export default function StemMixer({
   function applyBpmValue(nextBpmVal: number) {
     if (!Number.isFinite(nextBpmVal)) return;
     const clampedBpm = Number(
-      Math.max(40, Math.min(240, nextBpmVal)).toFixed(1),
+      Math.max(40, Math.min(240, nextBpmVal)).toFixed(2),
     );
+
+    // Pertahankan ketukan terdekat dari playhead (atau awal lagu) agar fase tidak
+    // bergeser saat BPM diubah; selisih BPM baru baru terasa menjauh dari titik itu.
+    const oldBeatSec = 60 / Math.max(40, Math.min(240, bpmRef.current || 120));
+    const oldOffset = beatOffsetRef.current || 0;
+    const pivotSong = Math.max(getCurrentSongPos(), gateRef.current ?? 0);
+    const pivotBeatTime =
+      oldOffset + Math.round((pivotSong - oldOffset) / oldBeatSec) * oldBeatSec;
+    const newBeatSec = 60 / clampedBpm;
+    const newOffset = Number(mod(pivotBeatTime, newBeatSec).toFixed(3));
+
     setBpm(clampedBpm);
     bpmRef.current = clampedBpm;
+    setBeatOffsetSec(newOffset);
+    beatOffsetRef.current = newOffset;
     if (isPlayingRef.current) {
       resetAndRunMetronomeFromSongTime(getCurrentSongPos());
     }
-    onSyncChange?.(jobId, Math.round(clampedBpm), beatOffsetRef.current);
+    onSyncChange?.(jobId, clampedBpm, newOffset);
   }
 
   function handleTapTempo() {
@@ -676,15 +826,21 @@ export default function StemMixer({
     const activePos = getCurrentSongPos();
     const safeBpm = Math.max(40, Math.min(240, bpmRef.current || 120));
     const beatSec = 60 / safeBpm;
-    const phaseSec = Number(
-      (((activePos % beatSec) + beatSec) % beatSec).toFixed(3),
+
+    // Cari hentakan drum terdekat (jendela tidak simetris karena reaksi manusia terlambat)
+    const snapped = snapToOnset(
+      onsetRef.current,
+      activePos - Math.min(0.22, beatSec * 0.45),
+      activePos + Math.min(0.08, beatSec * 0.2),
     );
+    const anchorSec = snapped ?? activePos;
+    const phaseSec = Number(mod(anchorSec, beatSec).toFixed(3));
     setBeatOffsetSec(phaseSec);
     beatOffsetRef.current = phaseSec;
     if (isPlayingRef.current) {
       resetAndRunMetronomeFromSongTime(activePos);
     }
-    onSyncChange?.(jobId, Math.round(safeBpm), phaseSec);
+    onSyncChange?.(jobId, safeBpm, phaseSec);
   }
 
   function handleBeatOffsetChange(nextOffset: number) {
@@ -695,7 +851,7 @@ export default function StemMixer({
     if (isPlayingRef.current) {
       resetAndRunMetronomeFromSongTime(getCurrentSongPos());
     }
-    onSyncChange?.(jobId, Math.round(bpmRef.current), rounded);
+    onSyncChange?.(jobId, bpmRef.current, rounded);
   }
 
   function handleNudgeBeatMs(deltaMs: number) {
@@ -715,8 +871,101 @@ export default function StemMixer({
     if (isPlayingRef.current) {
       resetAndRunMetronomeFromSongTime(getCurrentSongPos());
     }
-    onSyncChange?.(jobId, Math.round(initialBpm), initialBeatOffset);
+    onSyncChange?.(jobId, initialBpm, initialBeatOffset);
   }
+
+  function updateGate(enabled: boolean, custom: number | null) {
+    setGateEnabled(enabled);
+    setCustomStart(custom);
+    gateRef.current = enabled ? (custom ?? musicStartAuto) : null;
+    if (isPlayingRef.current) {
+      resetAndRunMetronomeFromSongTime(getCurrentSongPos());
+    }
+  }
+
+  // Terapkan hasil analisis backend ke mixer (dipakai tombol & auto-upgrade lagu lama)
+  const applyAnalysis = useCallback(
+    (nextBpm: number, nextOffset: number) => {
+      setBpm(nextBpm);
+      bpmRef.current = nextBpm;
+      setBeatOffsetSec(nextOffset);
+      beatOffsetRef.current = nextOffset;
+      if (isPlayingRef.current) {
+        resetAndRunMetronomeFromSongTime(getCurrentSongPos());
+      }
+      onSyncRef.current?.(jobId, nextBpm, nextOffset);
+    },
+    [getCurrentSongPos, jobId, resetAndRunMetronomeFromSongTime],
+  );
+
+  async function handleReanalyze() {
+    setAnalyzing(true);
+    setAnalyzeMsg(null);
+    try {
+      const res = await fetch(`${apiUrl}/stem-library/${jobId}/reanalyze`, {
+        method: "POST",
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || "Gagal menganalisis ulang beat.");
+      }
+      const data: {
+        item?: { detected_bpm?: number; beat_offset_sec?: number };
+      } = await res.json();
+      if (
+        typeof data.item?.detected_bpm === "number" &&
+        typeof data.item?.beat_offset_sec === "number"
+      ) {
+        applyAnalysis(data.item.detected_bpm, data.item.beat_offset_sec);
+        setAnalyzeMsg(
+          `Terdeteksi ${data.item.detected_bpm.toFixed(2)} BPM • offset ${data.item.beat_offset_sec.toFixed(3)}s`,
+        );
+      }
+    } catch (err) {
+      setAnalyzeMsg(
+        err instanceof Error ? err.message : "Gagal menganalisis ulang beat.",
+      );
+    } finally {
+      setAnalyzing(false);
+    }
+  }
+
+  // Lagu lama di library (analisis v1: BPM dibulatkan) di-upgrade otomatis sekali saja
+  useEffect(() => {
+    if (autoAnalyzedRef.current === jobId) return;
+    autoAnalyzedRef.current = jobId;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const res = await fetch(
+          `${apiUrl}/stem-library/${jobId}/reanalyze?only_if_outdated=true`,
+          { method: "POST" },
+        );
+        if (!res.ok || cancelled) return;
+        const data: {
+          skipped?: boolean;
+          item?: { detected_bpm?: number; beat_offset_sec?: number };
+        } = await res.json();
+        if (
+          !data.skipped &&
+          typeof data.item?.detected_bpm === "number" &&
+          typeof data.item?.beat_offset_sec === "number"
+        ) {
+          applyAnalysis(data.item.detected_bpm, data.item.beat_offset_sec);
+          setAnalyzeMsg(
+            "Sinkron beat lagu ini diperbarui otomatis (lebih akurat).",
+          );
+        }
+      } catch {
+        // Abaikan: mixer tetap memakai nilai sinkron yang ada
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [apiUrl, jobId, applyAnalysis]);
 
   async function handleResetAll() {
     setTracks(createInitialTracks());
@@ -729,6 +978,8 @@ export default function StemMixer({
     setMetroVolume(0.5);
     setMetroPan(0);
     setMetroEnabled(false);
+    setGateEnabled(true);
+    setCustomStart(null);
     setPlaybackRate(1);
     rateRef.current = 1;
     await handleStop();
@@ -780,14 +1031,25 @@ export default function StemMixer({
         const safeBpm = Math.max(40, Math.min(240, bpm || 120));
         const secondsPerBeat = 60 / safeBpm;
         const offset = beatOffsetSec || 0;
-        const firstStep = Math.ceil((0 - offset) / secondsPerBeat);
+        const gate = gateEnabled ? (customStart ?? musicStartAuto) : null;
+        const startIdx =
+          gate === null
+            ? Number.NEGATIVE_INFINITY
+            : Math.ceil(
+                (gate - offset) / secondsPerBeat - GATE_TOLERANCE_BEATS,
+              );
+        const firstStep = Math.max(
+          Math.ceil((0 - offset) / secondsPerBeat),
+          startIdx,
+        );
 
         for (let step = firstStep; ; step++) {
           const t = offset + step * secondsPerBeat;
           if (t >= duration) break;
           if (t < 0) continue;
 
-          const isDownbeat = ((step % 4) + 4) % 4 === 0;
+          const rel = gate === null ? step : step - startIdx;
+          const isDownbeat = mod(rel, 4) === 0;
           const osc = offlineCtx.createOscillator();
           const g = offlineCtx.createGain();
           const p = offlineCtx.createStereoPanner();
@@ -984,7 +1246,8 @@ export default function StemMixer({
               Metronome
             </span>
             <span className="rounded bg-zinc-800 px-2 py-0.5 text-[11px] font-mono text-emerald-400">
-              Auto Lagu: {initialBpm} BPM • Sync {initialBeatOffset.toFixed(3)}s
+              Auto Lagu: {initialBpm.toFixed(2)} BPM • Sync{" "}
+              {initialBeatOffset.toFixed(3)}s
             </span>
           </div>
 
@@ -1051,7 +1314,8 @@ export default function StemMixer({
                 onClick={handleResetBpm}
                 className="rounded-md border border-zinc-700 px-2.5 py-1 text-xs text-zinc-200 hover:bg-zinc-800"
               >
-                Reset Sync ({initialBpm} / {initialBeatOffset.toFixed(3)}s)
+                Reset Sync ({initialBpm.toFixed(2)} /{" "}
+                {initialBeatOffset.toFixed(3)}s)
               </button>
             )}
             <label className="inline-flex items-center gap-2 text-sm cursor-pointer ml-1">
@@ -1074,7 +1338,7 @@ export default function StemMixer({
                 type="number"
                 min={40}
                 max={240}
-                step={0.1}
+                step={0.01}
                 value={bpm}
                 onChange={(e) => applyBpmValue(Number(e.target.value))}
                 className="w-20 rounded border border-zinc-700 bg-zinc-900 px-1.5 py-0.5 text-right font-mono text-xs text-zinc-100"
@@ -1084,7 +1348,7 @@ export default function StemMixer({
               type="range"
               min={40}
               max={240}
-              step={0.1}
+              step={0.01}
               value={bpm}
               onChange={(e) => applyBpmValue(Number(e.target.value))}
               className="w-full accent-emerald-500"
@@ -1146,6 +1410,55 @@ export default function StemMixer({
               className="w-full accent-emerald-500"
             />
           </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 border-t border-zinc-800 pt-3 text-xs">
+          <label className="inline-flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={gateEnabled}
+              onChange={(e) => updateGate(e.target.checked, customStart)}
+              className="rounded accent-emerald-500"
+            />
+            <span>Metronome mulai saat lagu masuk</span>
+          </label>
+          {gateEnabled && (
+            <span className="rounded bg-zinc-800 px-2 py-0.5 font-mono text-emerald-400">
+              Mulai di {(customStart ?? musicStartAuto).toFixed(2)}s
+              {customStart === null ? " (auto)" : " (manual)"}
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={() =>
+              updateGate(true, Number(getCurrentSongPos().toFixed(3)))
+            }
+            className="rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-xs text-zinc-200 hover:bg-zinc-800"
+          >
+            Mulai dari posisi ini
+          </button>
+          {customStart !== null && (
+            <button
+              type="button"
+              onClick={() => updateGate(gateEnabled, null)}
+              className="rounded-md border border-zinc-700 px-2.5 py-1 text-xs text-zinc-200 hover:bg-zinc-800"
+            >
+              Kembali ke auto ({musicStartAuto.toFixed(2)}s)
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => void handleReanalyze()}
+            disabled={analyzing}
+            className="rounded-md border border-emerald-700 bg-emerald-950/40 px-2.5 py-1 text-xs text-emerald-300 hover:bg-emerald-900/40 disabled:opacity-50"
+          >
+            {analyzing ? "Menganalisis..." : "Deteksi Ulang Beat (Akurat)"}
+          </button>
+          {analyzeMsg && (
+            <span className="font-mono text-[11px] text-zinc-400">
+              {analyzeMsg}
+            </span>
+          )}
         </div>
       </div>
 
