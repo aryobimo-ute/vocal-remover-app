@@ -46,8 +46,10 @@ jobs: dict[str, dict] = {}
 PERCENT_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)%")
 
 
-class LibraryRenameRequest(BaseModel):
-    title: str
+class LibraryUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    beat_offset_sec: Optional[float] = None
+    detected_bpm: Optional[int] = None
 
 
 def _read_library_unlocked() -> list[dict]:
@@ -62,7 +64,11 @@ def _read_library_unlocked() -> list[dict]:
 
 def load_stem_library() -> list[dict]:
     with library_lock:
-        return _read_library_unlocked()
+        items = _read_library_unlocked()
+        for item in items:
+            if "beat_offset_sec" not in item:
+                item["beat_offset_sec"] = 0.0
+        return items
 
 
 def save_stem_to_library(entry: dict):
@@ -77,13 +83,25 @@ def save_stem_to_library(entry: dict):
         )
 
 
-def rename_stem_in_library(job_id: str, new_title: str) -> Optional[dict]:
+def update_stem_in_library(
+    job_id: str,
+    new_title: Optional[str] = None,
+    beat_offset_sec: Optional[float] = None,
+    detected_bpm: Optional[int] = None,
+) -> Optional[dict]:
     with library_lock:
         items = _read_library_unlocked()
         updated_item: Optional[dict] = None
         for item in items:
             if item.get("job_id") == job_id:
-                item["title"] = new_title
+                if new_title is not None:
+                    item["title"] = new_title
+                if beat_offset_sec is not None and math.isfinite(beat_offset_sec):
+                    item["beat_offset_sec"] = round(float(beat_offset_sec), 3)
+                if detected_bpm is not None:
+                    item["detected_bpm"] = int(max(40, min(240, detected_bpm)))
+                if "beat_offset_sec" not in item:
+                    item["beat_offset_sec"] = 0.0
                 updated_item = item
                 break
         if updated_item is None:
@@ -200,19 +218,86 @@ def download_from_youtube(job_id: str, url: str, job_dir: Path, prefer_audio_onl
     return downloaded, is_video
 
 
-def detect_bpm(audio_path: Path, job_id: str, progress: Optional[int] = None) -> int:
+def analyze_bpm_and_beat_offset(
+    audio_path: Path,
+    job_id: str,
+    progress: Optional[int] = None,
+    fallback_bpm: int = 120,
+) -> tuple[int, float]:
+    """Mendeteksi BPM serta fase offset ketukan (detik) agar selaras dengan ketukan drum."""
     try:
         y, sr = librosa.load(str(audio_path), sr=22050, mono=True)
-        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+        if y.size == 0:
+            return fallback_bpm, 0.0
+
+        onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+        tempo, beat_frames = librosa.beat.beat_track(
+            y=y,
+            sr=sr,
+            onset_envelope=onset_env,
+            units="frames",
+        )
+
         raw_bpm = float(np.asarray(tempo).reshape(-1)[0])
+        beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+
+        # Jika interval antar beat konsisten, gunakan median interval sebagai BPM yang lebih stabil
+        if len(beat_times) >= 4:
+            diffs = np.diff(beat_times)
+            valid_diffs = diffs[(diffs > 0.2) & (diffs < 1.6)]
+            if valid_diffs.size >= 3:
+                median_period = float(np.median(valid_diffs))
+                interval_bpm = 60.0 / median_period
+                if 40.0 <= interval_bpm <= 240.0:
+                    raw_bpm = interval_bpm
+
         if math.isnan(raw_bpm) or raw_bpm <= 0:
-            return 120
-        bpm_int = int(max(40, min(240, round(raw_bpm))))
-        log_step(job_id, "BPM", f"Tempo terdeteksi otomatis: {bpm_int} BPM", progress=progress)
-        return bpm_int
+            bpm_int = fallback_bpm
+        else:
+            bpm_int = int(max(40, min(240, round(raw_bpm))))
+
+        beat_period = 60.0 / float(bpm_int)
+        beat_offset_sec = 0.0
+
+        if len(beat_times) > 0:
+            # Cari fase ketukan (mod beat_period) yang paling sering muncul di beat_times
+            phases = np.mod(beat_times, beat_period)
+            # Gunakan circular mean / histogram binning pada [0, beat_period)
+            num_bins = 72
+            hist, bin_edges = np.histogram(phases, bins=num_bins, range=(0.0, beat_period))
+            best_bin = int(np.argmax(hist))
+            in_bin = phases[(phases >= bin_edges[best_bin]) & (phases <= bin_edges[best_bin + 1])]
+            if in_bin.size > 0:
+                phase_sec = float(np.mean(in_bin))
+            else:
+                phase_sec = float(phases[0])
+
+            # Haluskan lagi dengan puncak onset terdekat di sekitar fase awal
+            search_window = min(0.08, beat_period * 0.2)
+            onset_times = librosa.times_like(onset_env, sr=sr)
+            if onset_times.size > 0 and onset_env.size > 0:
+                # Cari transient kuat pertama atau sesuaikan ke beat_times[0] jika sangat dekat
+                first_beat = float(beat_times[0])
+                if abs(((first_beat - phase_sec + beat_period / 2) % beat_period) - beat_period / 2) <= search_window:
+                    phase_sec = float(first_beat % beat_period)
+
+            beat_offset_sec = round(phase_sec % beat_period, 3)
+
+        log_step(
+            job_id,
+            "BPM",
+            f"Tempo & sinkronisasi drum: {bpm_int} BPM (offset ketukan {beat_offset_sec:.2f}s)",
+            progress=progress,
+        )
+        return bpm_int, beat_offset_sec
     except Exception as exc:
-        log_step(job_id, "BPM", f"Gagal deteksi BPM otomatis ({exc}), default 120 BPM", progress=progress)
-        return 120
+        log_step(
+            job_id,
+            "BPM",
+            f"Gagal deteksi BPM/sinkron otomatis ({exc}), default {fallback_bpm} BPM / 0.00s",
+            progress=progress,
+        )
+        return fallback_bpm, 0.0
 
 
 def format_srt_time(seconds: float) -> str:
@@ -348,8 +433,11 @@ def execute_stem_job(job_id: str, input_path: Path, job_dir: Path):
             end_pct=22,
         )
 
-        detected_bpm = detect_bpm(wav_path, job_id, progress=25)
-        jobs[job_id]["detected_bpm"] = detected_bpm
+        initial_bpm, initial_offset = analyze_bpm_and_beat_offset(
+            wav_path, job_id, progress=25, fallback_bpm=120
+        )
+        jobs[job_id]["detected_bpm"] = initial_bpm
+        jobs[job_id]["beat_offset_sec"] = initial_offset
 
         demucs_out = job_dir / "demucs_out"
         run_cmd_with_log(
@@ -366,15 +454,20 @@ def execute_stem_job(job_id: str, input_path: Path, job_dir: Path):
 
         drums_wav = stem_dir / "drums.wav"
         if drums_wav.exists():
-            drum_bpm = detect_bpm(drums_wav, job_id, progress=96)
+            drum_bpm, drum_offset = analyze_bpm_and_beat_offset(
+                drums_wav, job_id, progress=96, fallback_bpm=initial_bpm
+            )
             jobs[job_id]["detected_bpm"] = drum_bpm
+            jobs[job_id]["beat_offset_sec"] = drum_offset
 
         final_bpm = jobs[job_id].get("detected_bpm", 120)
+        final_offset = jobs[job_id].get("beat_offset_sec", 0.0)
         library_entry = {
             "job_id": job_id,
             "title": jobs[job_id].get("source_label") or f"Track {job_id[:8]}",
             "stems": available_stems,
             "detected_bpm": final_bpm,
+            "beat_offset_sec": final_offset,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
 
@@ -472,6 +565,7 @@ async def process_media(
         "logs": [],
         "stems": [],
         "detected_bpm": 120,
+        "beat_offset_sec": 0.0,
         "result": None,
         "error": None,
     }
@@ -525,6 +619,7 @@ async def separate_stems(
         "stems": [],
         "source_label": source_label,
         "detected_bpm": 120,
+        "beat_offset_sec": 0.0,
         "result": None,
         "error": None,
     }
@@ -539,12 +634,19 @@ def get_stem_library():
 
 
 @app.patch("/stem-library/{job_id}")
-def rename_stem_library_item(job_id: str, payload: LibraryRenameRequest):
+def update_stem_library_item(job_id: str, payload: LibraryUpdateRequest):
     safe_id = os.path.basename(job_id)
-    cleaned_title = payload.title.strip()
-    if not cleaned_title:
-        raise HTTPException(status_code=400, detail="Nama label tidak boleh kosong.")
-    updated = rename_stem_in_library(safe_id, cleaned_title)
+    cleaned_title: Optional[str] = None
+    if payload.title is not None:
+        cleaned_title = payload.title.strip()
+        if not cleaned_title:
+            raise HTTPException(status_code=400, detail="Nama label tidak boleh kosong.")
+    updated = update_stem_in_library(
+        safe_id,
+        new_title=cleaned_title,
+        beat_offset_sec=payload.beat_offset_sec,
+        detected_bpm=payload.detected_bpm,
+    )
     if not updated:
         raise HTTPException(status_code=404, detail="Item library tidak ditemukan.")
     return {"updated": True, "item": updated}

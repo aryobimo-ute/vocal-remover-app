@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import StemMixer from "./StemMixer";
 
 type StemName = "drums" | "bass" | "guitar" | "piano" | "other" | "vocals";
@@ -13,6 +13,7 @@ type StemJobStatus = {
   logs: string[];
   stems: StemName[];
   detected_bpm?: number;
+  beat_offset_sec?: number;
   error: string | null;
 };
 
@@ -21,6 +22,7 @@ type LibraryItem = {
   title: string;
   stems: StemName[];
   detected_bpm: number;
+  beat_offset_sec?: number;
   created_at: string;
 };
 
@@ -29,6 +31,7 @@ type ActiveMixerTrack = {
   title: string;
   stems: StemName[];
   bpm: number;
+  beatOffsetSec: number;
 };
 
 const ACTIVE_TRACK_STORAGE_KEY = "stem_mixer_active_track_v1";
@@ -37,7 +40,17 @@ function readInitialActiveTrack(): ActiveMixerTrack | null {
   if (typeof window === "undefined") return null;
   try {
     const raw = window.sessionStorage.getItem(ACTIVE_TRACK_STORAGE_KEY);
-    return raw ? (JSON.parse(raw) as ActiveMixerTrack) : null;
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<ActiveMixerTrack>;
+    if (!parsed.jobId || !Array.isArray(parsed.stems)) return null;
+    return {
+      jobId: parsed.jobId,
+      title: parsed.title || parsed.jobId.slice(0, 8),
+      stems: parsed.stems,
+      bpm: typeof parsed.bpm === "number" ? parsed.bpm : 120,
+      beatOffsetSec:
+        typeof parsed.beatOffsetSec === "number" ? parsed.beatOffsetSec : 0,
+    };
   } catch {
     return null;
   }
@@ -65,35 +78,36 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
   const [activeTrack, setActiveTrack] = useState<ActiveMixerTrack | null>(
     readInitialActiveTrack,
   );
+  const activeTrackRef = useRef<ActiveMixerTrack | null>(activeTrack);
 
-  const fetchLibrary = useCallback(
-    async (withLoadingIndicator = false) => {
-      if (withLoadingIndicator) {
-        setLoadingLibrary(true);
-      }
-      try {
-        const res = await fetch(`${apiUrl}/stem-library`);
-        if (!res.ok) return;
-        const data: { items?: LibraryItem[] } = await res.json();
-        setLibrary(Array.isArray(data.items) ? data.items : []);
-      } catch {
-        // Abaikan error sesaat
-      } finally {
-        if (withLoadingIndicator) {
-          setLoadingLibrary(false);
-        }
-      }
-    },
-    [apiUrl],
-  );
+  useEffect(() => {
+    activeTrackRef.current = activeTrack;
+  }, [activeTrack]);
 
   useEffect(() => {
     let active = true;
     fetch(`${apiUrl}/stem-library`)
       .then((res) => (res.ok ? res.json() : null))
       .then((data: { items?: LibraryItem[] } | null) => {
-        if (active && data && Array.isArray(data.items)) {
-          setLibrary(data.items);
+        if (!active || !data || !Array.isArray(data.items)) return;
+        const items = data.items;
+        setLibrary(items);
+
+        const currentActive = activeTrackRef.current;
+        if (currentActive) {
+          const match = items.find((x) => x.job_id === currentActive.jobId);
+          if (match) {
+            setActiveTrack({
+              ...currentActive,
+              title: match.title,
+              stems: match.stems,
+              bpm: match.detected_bpm ?? currentActive.bpm,
+              beatOffsetSec:
+                typeof match.beat_offset_sec === "number"
+                  ? match.beat_offset_sec
+                  : currentActive.beatOffsetSec,
+            });
+          }
         }
       })
       .catch(() => {
@@ -103,6 +117,38 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
     return () => {
       active = false;
     };
+  }, [apiUrl]);
+
+  const handleRefreshLibrary = useCallback(async () => {
+    setLoadingLibrary(true);
+    try {
+      const res = await fetch(`${apiUrl}/stem-library`);
+      if (!res.ok) return;
+      const data: { items?: LibraryItem[] } = await res.json();
+      const items = Array.isArray(data.items) ? data.items : [];
+      setLibrary(items);
+
+      const currentActive = activeTrackRef.current;
+      if (currentActive) {
+        const match = items.find((x) => x.job_id === currentActive.jobId);
+        if (match) {
+          setActiveTrack({
+            ...currentActive,
+            title: match.title,
+            stems: match.stems,
+            bpm: match.detected_bpm ?? currentActive.bpm,
+            beatOffsetSec:
+              typeof match.beat_offset_sec === "number"
+                ? match.beat_offset_sec
+                : currentActive.beatOffsetSec,
+          });
+        }
+      }
+    } catch {
+      // Abaikan error sesaat
+    } finally {
+      setLoadingLibrary(false);
+    }
   }, [apiUrl]);
 
   useEffect(() => {
@@ -132,22 +178,92 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
         setLoading(false);
         if (data.status === "completed" && data.stems.length > 0) {
           const bpmVal = data.detected_bpm ?? 120;
+          const offsetVal =
+            typeof data.beat_offset_sec === "number" ? data.beat_offset_sec : 0;
           const label =
             sourceType === "file" && file?.name
               ? file.name
               : youtubeUrl.trim() || `Track ${jobId.slice(0, 8)}`;
+          const newEntry: LibraryItem = {
+            job_id: jobId,
+            title: label,
+            stems: data.stems,
+            detected_bpm: bpmVal,
+            beat_offset_sec: offsetVal,
+            created_at: new Date().toISOString().slice(0, 19).replace("T", " "),
+          };
           setActiveTrack({
             jobId,
             title: label,
             stems: data.stems,
             bpm: bpmVal,
+            beatOffsetSec: offsetVal,
           });
-          void fetchLibrary(false);
+          setLibrary((prev) => [
+            newEntry,
+            ...prev.filter((x) => x.job_id !== jobId),
+          ]);
         }
       }
     }, 1500);
     return () => clearInterval(timer);
-  }, [jobId, apiUrl, sourceType, file, youtubeUrl, fetchLibrary]);
+  }, [jobId, apiUrl, sourceType, file, youtubeUrl]);
+
+  const handlePersistSyncToLibrary = useCallback(
+    async (targetJobId: string, nextBpm: number, nextBeatOffsetSec: number) => {
+      try {
+        const res = await fetch(`${apiUrl}/stem-library/${targetJobId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            detected_bpm: nextBpm,
+            beat_offset_sec: nextBeatOffsetSec,
+          }),
+        });
+        if (!res.ok) return;
+        const data: { item?: LibraryItem } = await res.json();
+        const savedOffset =
+          typeof data.item?.beat_offset_sec === "number"
+            ? data.item.beat_offset_sec
+            : nextBeatOffsetSec;
+        const savedBpm = data.item?.detected_bpm ?? nextBpm;
+
+        setLibrary((prev) =>
+          prev.map((x) =>
+            x.job_id === targetJobId
+              ? {
+                  ...x,
+                  detected_bpm: savedBpm,
+                  beat_offset_sec: savedOffset,
+                }
+              : x,
+          ),
+        );
+
+        // Simpan juga ke sessionStorage agar saat tab/halaman di-refresh tetap terbaca
+        const currentActive = activeTrackRef.current;
+        if (currentActive && currentActive.jobId === targetJobId) {
+          const updatedActive: ActiveMixerTrack = {
+            ...currentActive,
+            bpm: savedBpm,
+            beatOffsetSec: savedOffset,
+          };
+          activeTrackRef.current = updatedActive;
+          try {
+            window.sessionStorage.setItem(
+              ACTIVE_TRACK_STORAGE_KEY,
+              JSON.stringify(updatedActive),
+            );
+          } catch {
+            // Abaikan error storage
+          }
+        }
+      } catch {
+        // Abaikan error sesaat
+      }
+    },
+    [apiUrl],
+  );
 
   async function handleSeparate(e: React.FormEvent) {
     e.preventDefault();
@@ -179,6 +295,8 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
       title: item.title,
       stems: item.stems,
       bpm: item.detected_bpm ?? 120,
+      beatOffsetSec:
+        typeof item.beat_offset_sec === "number" ? item.beat_offset_sec : 0,
     });
   }
 
@@ -212,11 +330,10 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
           x.job_id === targetJobId ? { ...x, title: finalTitle } : x,
         ),
       );
-      setActiveTrack((prev) =>
-        prev && prev.jobId === targetJobId
-          ? { ...prev, title: finalTitle }
-          : prev,
-      );
+      const currentActive = activeTrackRef.current;
+      if (currentActive && currentActive.jobId === targetJobId) {
+        setActiveTrack({ ...currentActive, title: finalTitle });
+      }
       setEditingJobId(null);
       setEditingTitle("");
     } finally {
@@ -244,7 +361,7 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
         if (editingJobId === targetJobId) {
           handleCancelRename();
         }
-        if (activeTrack?.jobId === targetJobId) {
+        if (activeTrackRef.current?.jobId === targetJobId) {
           setActiveTrack(null);
         }
         setConfirmingDeleteId(null);
@@ -285,7 +402,7 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
           </div>
           <button
             type="button"
-            onClick={() => void fetchLibrary(true)}
+            onClick={() => void handleRefreshLibrary()}
             className="rounded-lg border border-zinc-700 px-3 py-1 text-xs text-zinc-200 hover:bg-zinc-800"
           >
             {loadingLibrary ? "Memuat..." : "Refresh Library"}
@@ -304,6 +421,10 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
               const isSaving = savingTitleId === item.job_id;
               const isConfirmingDelete = confirmingDeleteId === item.job_id;
               const isDeleting = deletingJobId === item.job_id;
+              const itemOffset =
+                typeof item.beat_offset_sec === "number"
+                  ? item.beat_offset_sec
+                  : 0;
 
               return (
                 <div
@@ -359,8 +480,8 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
                       </p>
                     )}
                     <p className="text-[11px] font-mono text-zinc-400">
-                      {item.detected_bpm} BPM • {item.stems.length} stem •{" "}
-                      {item.created_at}
+                      {item.detected_bpm} BPM • sync {itemOffset.toFixed(2)}s •{" "}
+                      {item.stems.length} stem • {item.created_at}
                     </p>
                     {isConfirmingDelete && (
                       <p className="text-xs text-red-300 mt-1">
@@ -531,11 +652,13 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
             </span>
           </div>
           <StemMixer
-            key={`${activeTrack.jobId}-${activeTrack.bpm}`}
+            key={activeTrack.jobId}
             apiUrl={apiUrl}
             jobId={activeTrack.jobId}
             stems={activeTrack.stems}
             initialBpm={activeTrack.bpm}
+            initialBeatOffset={activeTrack.beatOffsetSec}
+            onSyncChange={handlePersistSyncToLibrary}
           />
         </div>
       )}

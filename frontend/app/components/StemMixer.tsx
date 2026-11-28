@@ -104,11 +104,15 @@ export default function StemMixer({
   jobId,
   stems,
   initialBpm = 120,
+  initialBeatOffset = 0,
+  onSyncChange,
 }: {
   apiUrl: string;
   jobId: string;
   stems: StemName[];
   initialBpm?: number;
+  initialBeatOffset?: number;
+  onSyncChange?: (jobId: string, bpm: number, beatOffsetSec: number) => void;
 }) {
   const [buffers, setBuffers] = useState<
     Partial<Record<StemName, AudioBuffer>>
@@ -119,6 +123,7 @@ export default function StemMixer({
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [playbackRate, setPlaybackRate] = useState<number>(1);
+  const [beatFlash, setBeatFlash] = useState<"none" | "down" | "beat">("none");
 
   // Master volume khusus 6 stem (terpisah dari metronome)
   const [masterStemsVolume, setMasterStemsVolume] = useState<number>(1);
@@ -126,17 +131,20 @@ export default function StemMixer({
   const [tracks, setTracks] =
     useState<Record<StemName, TrackControl>>(createInitialTracks);
 
-  // Metronome + sinkronisasi fase ketukan (beatOffsetSec)
+  // Metronome + sinkronisasi fase ketukan drum (beatOffsetSec)
   const [metroEnabled, setMetroEnabled] = useState(false);
   const [bpm, setBpm] = useState<number>(initialBpm);
-  const [beatOffsetSec, setBeatOffsetSec] = useState<number>(0);
+  const [beatOffsetSec, setBeatOffsetSec] = useState<number>(initialBeatOffset);
   const [metroVolume, setMetroVolume] = useState(0.5);
   const [metroPan, setMetroPan] = useState(0);
   const [exporting, setExporting] = useState(false);
 
+  const syncedSeedKeyRef = useRef<string>(
+    `${jobId}|${initialBpm}|${initialBeatOffset}`,
+  );
   const tapTimesRef = useRef<number[]>([]);
   const bpmRef = useRef<number>(initialBpm);
-  const beatOffsetRef = useRef<number>(0);
+  const beatOffsetRef = useRef<number>(initialBeatOffset);
   const rateRef = useRef<number>(1);
   const masterStemsVolRef = useRef<number>(1);
   const tracksRef = useRef<Record<StemName, TrackControl>>(tracks);
@@ -162,13 +170,15 @@ export default function StemMixer({
   >({});
   const metroGainRef = useRef<GainNode | null>(null);
   const metroPannerRef = useRef<StereoPannerNode | null>(null);
+  const scheduledOscsRef = useRef<Set<OscillatorNode>>(new Set());
+  const flashTimeoutRef = useRef<number | null>(null);
   const metroTimerRef = useRef<number | null>(null);
   const playheadRafRef = useRef<number | null>(null);
-  const nextSongBeatTimeRef = useRef<number>(0);
-  const beatCounterRef = useRef<number>(0);
+  const nextBeatIndexRef = useRef<number>(0);
   const anchorCtxTimeRef = useRef<number>(0);
   const anchorSongTimeRef = useRef<number>(0);
   const currentSongPosRef = useRef<number>(0);
+  const isPlayingRef = useRef<boolean>(false);
 
   useEffect(() => {
     bpmRef.current = bpm;
@@ -201,7 +211,35 @@ export default function StemMixer({
     };
   }, [metroEnabled, metroVolume, metroPan]);
 
+  const clearScheduledClicks = useCallback(() => {
+    scheduledOscsRef.current.forEach((osc) => {
+      try {
+        osc.stop();
+        osc.disconnect();
+      } catch {
+        // Abaikan jika sudah selesai/terputus
+      }
+    });
+    scheduledOscsRef.current.clear();
+  }, []);
+
+  const getCurrentSongPos = useCallback((): number => {
+    if (!isPlayingRef.current || !ctxRef.current) {
+      return currentSongPosRef.current;
+    }
+    const elapsedAudioSec =
+      (ctxRef.current.currentTime - anchorCtxTimeRef.current) * rateRef.current;
+    return Math.max(
+      0,
+      Math.min(
+        duration || Infinity,
+        anchorSongTimeRef.current + elapsedAudioSec,
+      ),
+    );
+  }, [duration]);
+
   const stopAudioNodes = useCallback(() => {
+    isPlayingRef.current = false;
     if (metroTimerRef.current) {
       clearInterval(metroTimerRef.current);
       metroTimerRef.current = null;
@@ -210,6 +248,12 @@ export default function StemMixer({
       cancelAnimationFrame(playheadRafRef.current);
       playheadRafRef.current = null;
     }
+    if (flashTimeoutRef.current) {
+      clearTimeout(flashTimeoutRef.current);
+      flashTimeoutRef.current = null;
+    }
+    setBeatFlash("none");
+    clearScheduledClicks();
     Object.values(stemSourcesRef.current).forEach((ns) => {
       try {
         ns?.source.stop();
@@ -222,78 +266,143 @@ export default function StemMixer({
     masterStemsGainRef.current = null;
     metroGainRef.current = null;
     metroPannerRef.current = null;
+  }, [clearScheduledClicks]);
+
+  const triggerVisualFlash = useCallback((isDownbeat: boolean) => {
+    setBeatFlash(isDownbeat ? "down" : "beat");
+    if (flashTimeoutRef.current) {
+      clearTimeout(flashTimeoutRef.current);
+    }
+    flashTimeoutRef.current = window.setTimeout(() => {
+      setBeatFlash("none");
+    }, 90);
   }, []);
 
   const scheduleMetronomeClickAtCtxTime = useCallback(
     (ctxTime: number, beatIndex: number) => {
       const ctx = ctxRef.current;
-      if (!ctx || !metroGainRef.current || !metroPannerRef.current) return;
-      if (ctxTime < ctx.currentTime) return;
+      if (!ctx || !metroGainRef.current) return;
+      if (ctxTime < ctx.currentTime - 0.005) return;
 
+      const safeStart = Math.max(ctx.currentTime, ctxTime);
       const isDownbeat = ((beatIndex % 4) + 4) % 4 === 0;
       const osc = ctx.createOscillator();
       const clickGain = ctx.createGain();
       osc.type = "triangle";
-      osc.frequency.setValueAtTime(isDownbeat ? 1050 : 750, ctxTime);
+      osc.frequency.setValueAtTime(isDownbeat ? 1100 : 780, safeStart);
 
-      clickGain.gain.setValueAtTime(0.001, ctxTime);
-      clickGain.gain.exponentialRampToValueAtTime(1.0, ctxTime + 0.003);
-      clickGain.gain.exponentialRampToValueAtTime(0.0001, ctxTime + 0.045);
+      clickGain.gain.setValueAtTime(0.0001, safeStart);
+      clickGain.gain.exponentialRampToValueAtTime(1.0, safeStart + 0.002);
+      clickGain.gain.exponentialRampToValueAtTime(0.0001, safeStart + 0.04);
 
       osc.connect(clickGain);
       clickGain.connect(metroGainRef.current);
-      metroGainRef.current.connect(metroPannerRef.current);
-      metroPannerRef.current.connect(ctx.destination);
 
-      osc.start(ctxTime);
-      osc.stop(ctxTime + 0.05);
+      scheduledOscsRef.current.add(osc);
+      osc.onended = () => {
+        scheduledOscsRef.current.delete(osc);
+        try {
+          osc.disconnect();
+          clickGain.disconnect();
+        } catch {
+          // Abaikan
+        }
+      };
+
+      const delayMs = Math.max(0, (safeStart - ctx.currentTime) * 1000);
+      window.setTimeout(() => {
+        if (isPlayingRef.current) {
+          triggerVisualFlash(isDownbeat);
+        }
+      }, delayMs);
+
+      osc.start(safeStart);
+      osc.stop(safeStart + 0.045);
     },
-    [],
+    [triggerVisualFlash],
   );
 
-  const startMetronomeScheduler = useCallback(
+  // Hitung beat grid secara konsisten: beatTime(k) = offset + k * beatSec
+  const resetAndRunMetronomeFromSongTime = useCallback(
     (fromSongSec: number) => {
+      clearScheduledClicks();
+      if (metroTimerRef.current) {
+        clearInterval(metroTimerRef.current);
+        metroTimerRef.current = null;
+      }
+
       const ctx = ctxRef.current;
-      if (!ctx) return;
+      if (!ctx || !isPlayingRef.current) return;
 
       const safeBpm = Math.max(40, Math.min(240, bpmRef.current || 120));
       const beatSec = 60 / safeBpm;
       const offset = beatOffsetRef.current || 0;
 
-      // Hitung indeks beat berikutnya relatif terhadap grid lagu (offset + k * beatSec)
-      const rawSteps = (fromSongSec - offset) / beatSec;
-      const nextStepIdx = Math.ceil(rawSteps - 1e-6);
-      beatCounterRef.current = nextStepIdx;
-      nextSongBeatTimeRef.current = offset + nextStepIdx * beatSec;
+      const k = Math.ceil((fromSongSec - offset) / beatSec - 1e-4);
+      nextBeatIndexRef.current = k;
 
-      if (metroTimerRef.current) {
-        clearInterval(metroTimerRef.current);
-      }
+      const pumpClicks = () => {
+        const currentCtx = ctxRef.current;
+        if (!currentCtx || !isPlayingRef.current) return;
 
-      metroTimerRef.current = window.setInterval(() => {
-        if (!ctxRef.current) return;
         const activeBpm = Math.max(40, Math.min(240, bpmRef.current || 120));
         const activeBeatSec = 60 / activeBpm;
+        const activeOffset = beatOffsetRef.current || 0;
         const activeRate = Math.max(0.25, rateRef.current || 1);
 
         const elapsedAudioSec =
-          (ctxRef.current.currentTime - anchorCtxTimeRef.current) * activeRate;
-        const currentSongSec = anchorSongTimeRef.current + elapsedAudioSec;
-        const lookaheadSongSec = currentSongSec + 0.12 * activeRate;
+          (currentCtx.currentTime - anchorCtxTimeRef.current) * activeRate;
+        const nowSongSec = anchorSongTimeRef.current + elapsedAudioSec;
+        const lookaheadSongSec = nowSongSec + 0.09 * activeRate;
 
-        while (nextSongBeatTimeRef.current <= lookaheadSongSec) {
-          const songDeltaSec =
-            nextSongBeatTimeRef.current - anchorSongTimeRef.current;
-          const ctxTime = anchorCtxTimeRef.current + songDeltaSec / activeRate;
-          scheduleMetronomeClickAtCtxTime(ctxTime, beatCounterRef.current);
+        while (true) {
+          const beatSongTime =
+            activeOffset + nextBeatIndexRef.current * activeBeatSec;
+          if (beatSongTime > lookaheadSongSec) break;
 
-          beatCounterRef.current += 1;
-          nextSongBeatTimeRef.current += activeBeatSec;
+          if (beatSongTime >= nowSongSec - 0.015 * activeRate) {
+            const deltaSongSec = beatSongTime - anchorSongTimeRef.current;
+            const targetCtxTime =
+              anchorCtxTimeRef.current + deltaSongSec / activeRate;
+            scheduleMetronomeClickAtCtxTime(
+              targetCtxTime,
+              nextBeatIndexRef.current,
+            );
+          }
+          nextBeatIndexRef.current += 1;
         }
-      }, 25);
+      };
+
+      pumpClicks();
+      metroTimerRef.current = window.setInterval(pumpClicks, 18);
     },
-    [scheduleMetronomeClickAtCtxTime],
+    [clearScheduledClicks, scheduleMetronomeClickAtCtxTime],
   );
+
+  // Sinkronkan nilai awal dari library saat load awal / ganti lagu tanpa me-remount mixer
+  useEffect(() => {
+    const nextSeedKey = `${jobId}|${initialBpm}|${initialBeatOffset}`;
+    if (syncedSeedKeyRef.current === nextSeedKey) return;
+    syncedSeedKeyRef.current = nextSeedKey;
+
+    const timer = window.setTimeout(() => {
+      setBpm(initialBpm);
+      bpmRef.current = initialBpm;
+      setBeatOffsetSec(initialBeatOffset);
+      beatOffsetRef.current = initialBeatOffset;
+      if (isPlayingRef.current) {
+        resetAndRunMetronomeFromSongTime(getCurrentSongPos());
+      }
+    }, 0);
+
+    return () => window.clearTimeout(timer);
+  }, [
+    jobId,
+    initialBpm,
+    initialBeatOffset,
+    getCurrentSongPos,
+    resetAndRunMetronomeFromSongTime,
+  ]);
 
   const startPlaybackFromOffset = useCallback(
     async (offsetSec: number, rateToUse: number) => {
@@ -322,7 +431,7 @@ export default function StemMixer({
       masterStemsGain.connect(ctx.destination);
       masterStemsGainRef.current = masterStemsGain;
 
-      // Jalur metronome terpisah langsung ke destination
+      // Jalur metronome terpisah: hubungkan sekali saja
       const metroGain = ctx.createGain();
       metroGain.gain.value = metroRef.current.enabled
         ? metroRef.current.volume
@@ -337,7 +446,8 @@ export default function StemMixer({
       const currentTracks = tracksRef.current;
       const hasSolo = stems.some((s) => currentTracks[s]?.solo);
 
-      anchorCtxTimeRef.current = ctx.currentTime;
+      const startCtxTime = ctx.currentTime + 0.02;
+      anchorCtxTimeRef.current = startCtxTime;
       anchorSongTimeRef.current = clampedOffset;
       currentSongPosRef.current = clampedOffset;
       setCurrentTime(clampedOffset);
@@ -362,19 +472,23 @@ export default function StemMixer({
         gain.connect(panner);
         panner.connect(masterStemsGain);
 
-        source.start(0, clampedOffset);
+        source.start(startCtxTime, clampedOffset);
         stemSourcesRef.current[s] = { source, gain, panner };
       }
 
-      startMetronomeScheduler(clampedOffset);
+      isPlayingRef.current = true;
       setIsPlaying(true);
+      resetAndRunMetronomeFromSongTime(clampedOffset);
 
       const tickPlayhead = () => {
-        if (!ctxRef.current) return;
+        if (!ctxRef.current || !isPlayingRef.current) return;
         const elapsedAudioSec =
           (ctxRef.current.currentTime - anchorCtxTimeRef.current) *
           rateRef.current;
-        const nextPos = anchorSongTimeRef.current + elapsedAudioSec;
+        const nextPos = Math.max(
+          clampedOffset,
+          anchorSongTimeRef.current + elapsedAudioSec,
+        );
 
         if (nextPos >= duration) {
           currentSongPosRef.current = 0;
@@ -397,7 +511,7 @@ export default function StemMixer({
       buffers,
       duration,
       loadingStems,
-      startMetronomeScheduler,
+      resetAndRunMetronomeFromSongTime,
       stems,
       stopAudioNodes,
     ],
@@ -478,28 +592,14 @@ export default function StemMixer({
     }
   }, [metroEnabled, metroVolume, metroPan]);
 
-  // Saat BPM atau Beat Offset diubah saat sedang play, hitung ulang jadwal ketukan berikutnya
-  useEffect(() => {
-    if (!isPlaying || !ctxRef.current) return;
-    const elapsedAudioSec =
-      (ctxRef.current.currentTime - anchorCtxTimeRef.current) * rateRef.current;
-    const nowSongSec = anchorSongTimeRef.current + elapsedAudioSec;
-    startMetronomeScheduler(nowSongSec);
-  }, [bpm, beatOffsetSec, isPlaying, startMetronomeScheduler]);
-
   async function handlePlay() {
-    if (isPlaying || loadingStems) return;
+    if (isPlayingRef.current || loadingStems) return;
     await startPlaybackFromOffset(currentSongPosRef.current, playbackRate);
   }
 
   async function handlePause() {
-    if (!isPlaying || !ctxRef.current) return;
-    const elapsedAudioSec =
-      (ctxRef.current.currentTime - anchorCtxTimeRef.current) * rateRef.current;
-    const pausedAt = Math.min(
-      duration,
-      anchorSongTimeRef.current + elapsedAudioSec,
-    );
+    if (!isPlayingRef.current || !ctxRef.current) return;
+    const pausedAt = Math.min(duration, getCurrentSongPos());
     currentSongPosRef.current = pausedAt;
     setCurrentTime(pausedAt);
     stopAudioNodes();
@@ -523,23 +623,34 @@ export default function StemMixer({
     const clamped = Math.max(0, Math.min(duration, nextSec));
     currentSongPosRef.current = clamped;
     setCurrentTime(clamped);
-    if (isPlaying) {
+    if (isPlayingRef.current) {
       await startPlaybackFromOffset(clamped, playbackRate);
     }
   }
 
   async function handleRateChange(nextRate: number) {
+    const nowPos = Math.min(duration, getCurrentSongPos());
     setPlaybackRate(nextRate);
     rateRef.current = nextRate;
-    if (isPlaying && ctxRef.current) {
-      const elapsedAudioSec =
-        (ctxRef.current.currentTime - anchorCtxTimeRef.current) * nextRate;
-      const nowPos = Math.min(
-        duration,
-        anchorSongTimeRef.current + elapsedAudioSec,
-      );
+    currentSongPosRef.current = nowPos;
+    setCurrentTime(nowPos);
+
+    if (isPlayingRef.current) {
       await startPlaybackFromOffset(nowPos, nextRate);
     }
+  }
+
+  function applyBpmValue(nextBpmVal: number) {
+    if (!Number.isFinite(nextBpmVal)) return;
+    const clampedBpm = Number(
+      Math.max(40, Math.min(240, nextBpmVal)).toFixed(1),
+    );
+    setBpm(clampedBpm);
+    bpmRef.current = clampedBpm;
+    if (isPlayingRef.current) {
+      resetAndRunMetronomeFromSongTime(getCurrentSongPos());
+    }
+    onSyncChange?.(jobId, Math.round(clampedBpm), beatOffsetRef.current);
   }
 
   function handleTapTempo() {
@@ -554,34 +665,57 @@ export default function StemMixer({
         intervals.push(recent[i] - recent[i - 1]);
       }
       const avgMs = intervals.reduce((a, b) => a + b, 0) / intervals.length;
-      const tappedBpm = Math.round(60000 / avgMs);
+      const tappedBpm = Number((60000 / avgMs).toFixed(1));
       if (tappedBpm >= 40 && tappedBpm <= 240) {
-        setBpm(tappedBpm);
-        bpmRef.current = tappedBpm;
+        applyBpmValue(tappedBpm);
       }
     }
   }
 
   function handleAlignBeatNow() {
-    const activePos =
-      isPlaying && ctxRef.current
-        ? Math.min(
-            duration,
-            anchorSongTimeRef.current +
-              (ctxRef.current.currentTime - anchorCtxTimeRef.current) *
-                rateRef.current,
-          )
-        : currentSongPosRef.current;
-    const roundedOffset = Number(activePos.toFixed(2));
-    setBeatOffsetSec(roundedOffset);
-    beatOffsetRef.current = roundedOffset;
+    const activePos = getCurrentSongPos();
+    const safeBpm = Math.max(40, Math.min(240, bpmRef.current || 120));
+    const beatSec = 60 / safeBpm;
+    const phaseSec = Number(
+      (((activePos % beatSec) + beatSec) % beatSec).toFixed(3),
+    );
+    setBeatOffsetSec(phaseSec);
+    beatOffsetRef.current = phaseSec;
+    if (isPlayingRef.current) {
+      resetAndRunMetronomeFromSongTime(activePos);
+    }
+    onSyncChange?.(jobId, Math.round(safeBpm), phaseSec);
+  }
+
+  function handleBeatOffsetChange(nextOffset: number) {
+    if (!Number.isFinite(nextOffset)) return;
+    const rounded = Number(nextOffset.toFixed(3));
+    setBeatOffsetSec(rounded);
+    beatOffsetRef.current = rounded;
+    if (isPlayingRef.current) {
+      resetAndRunMetronomeFromSongTime(getCurrentSongPos());
+    }
+    onSyncChange?.(jobId, Math.round(bpmRef.current), rounded);
+  }
+
+  function handleNudgeBeatMs(deltaMs: number) {
+    const next = Number(
+      Math.max(-2, Math.min(2, beatOffsetRef.current + deltaMs / 1000)).toFixed(
+        3,
+      ),
+    );
+    handleBeatOffsetChange(next);
   }
 
   function handleResetBpm() {
     setBpm(initialBpm);
     bpmRef.current = initialBpm;
-    setBeatOffsetSec(0);
-    beatOffsetRef.current = 0;
+    setBeatOffsetSec(initialBeatOffset);
+    beatOffsetRef.current = initialBeatOffset;
+    if (isPlayingRef.current) {
+      resetAndRunMetronomeFromSongTime(getCurrentSongPos());
+    }
+    onSyncChange?.(jobId, Math.round(initialBpm), initialBeatOffset);
   }
 
   async function handleResetAll() {
@@ -590,8 +724,8 @@ export default function StemMixer({
     masterStemsVolRef.current = 1;
     setBpm(initialBpm);
     bpmRef.current = initialBpm;
-    setBeatOffsetSec(0);
-    beatOffsetRef.current = 0;
+    setBeatOffsetSec(initialBeatOffset);
+    beatOffsetRef.current = initialBeatOffset;
     setMetroVolume(0.5);
     setMetroPan(0);
     setMetroEnabled(false);
@@ -659,13 +793,13 @@ export default function StemMixer({
           const p = offlineCtx.createStereoPanner();
 
           osc.type = "triangle";
-          osc.frequency.setValueAtTime(isDownbeat ? 1050 : 750, t);
+          osc.frequency.setValueAtTime(isDownbeat ? 1100 : 780, t);
 
-          g.gain.setValueAtTime(0.001, t);
-          g.gain.exponentialRampToValueAtTime(metroVolume, t + 0.003);
+          g.gain.setValueAtTime(0.0001, t);
+          g.gain.exponentialRampToValueAtTime(metroVolume, t + 0.002);
           g.gain.exponentialRampToValueAtTime(
             0.0001,
-            Math.min(duration, t + 0.045),
+            Math.min(duration, t + 0.04),
           );
 
           p.pan.value = metroPan;
@@ -675,7 +809,7 @@ export default function StemMixer({
           p.connect(offlineCtx.destination);
 
           osc.start(t);
-          osc.stop(Math.min(duration, t + 0.05));
+          osc.stop(Math.min(duration, t + 0.045));
         }
       }
 
@@ -836,15 +970,39 @@ export default function StemMixer({
       <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-4 space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex flex-wrap items-center gap-2">
+            <span
+              className={`h-3 w-3 rounded-full transition-transform duration-75 ${
+                beatFlash === "down"
+                  ? "bg-emerald-400 scale-125 shadow-[0_0_10px_#34d399]"
+                  : beatFlash === "beat"
+                    ? "bg-amber-300 scale-110"
+                    : "bg-zinc-700"
+              }`}
+              title="Indikator Ketukan Metronome"
+            />
             <span className="text-sm font-semibold text-zinc-100">
               Metronome
             </span>
             <span className="rounded bg-zinc-800 px-2 py-0.5 text-[11px] font-mono text-emerald-400">
-              Auto Lagu: {initialBpm} BPM
+              Auto Lagu: {initialBpm} BPM • Sync {initialBeatOffset.toFixed(3)}s
             </span>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => applyBpmValue(bpm / 2)}
+              className="rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-[11px] font-mono text-zinc-300 hover:bg-zinc-800"
+            >
+              ÷2 BPM
+            </button>
+            <button
+              type="button"
+              onClick={() => applyBpmValue(bpm * 2)}
+              className="rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-[11px] font-mono text-zinc-300 hover:bg-zinc-800"
+            >
+              ×2 BPM
+            </button>
             <button
               type="button"
               onClick={handleTapTempo}
@@ -859,13 +1017,41 @@ export default function StemMixer({
             >
               Pas Beat di Posisi Ini
             </button>
-            {(bpm !== initialBpm || beatOffsetSec !== 0) && (
+            <button
+              type="button"
+              onClick={() => handleNudgeBeatMs(-50)}
+              className="rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-[11px] font-mono text-zinc-300 hover:bg-zinc-800"
+            >
+              -50ms
+            </button>
+            <button
+              type="button"
+              onClick={() => handleNudgeBeatMs(-10)}
+              className="rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-[11px] font-mono text-zinc-300 hover:bg-zinc-800"
+            >
+              -10ms
+            </button>
+            <button
+              type="button"
+              onClick={() => handleNudgeBeatMs(10)}
+              className="rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-[11px] font-mono text-zinc-300 hover:bg-zinc-800"
+            >
+              +10ms
+            </button>
+            <button
+              type="button"
+              onClick={() => handleNudgeBeatMs(50)}
+              className="rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-[11px] font-mono text-zinc-300 hover:bg-zinc-800"
+            >
+              +50ms
+            </button>
+            {(bpm !== initialBpm || beatOffsetSec !== initialBeatOffset) && (
               <button
                 type="button"
                 onClick={handleResetBpm}
                 className="rounded-md border border-zinc-700 px-2.5 py-1 text-xs text-zinc-200 hover:bg-zinc-800"
               >
-                Reset BPM ({initialBpm})
+                Reset Sync ({initialBpm} / {initialBeatOffset.toFixed(3)}s)
               </button>
             )}
             <label className="inline-flex items-center gap-2 text-sm cursor-pointer ml-1">
@@ -882,16 +1068,25 @@ export default function StemMixer({
 
         <div className="grid grid-cols-1 sm:grid-cols-4 gap-4 text-xs">
           <div>
-            <div className="flex justify-between mb-1">
+            <div className="flex items-center justify-between mb-1 gap-2">
               <span>BPM</span>
-              <span className="font-mono">{bpm}</span>
+              <input
+                type="number"
+                min={40}
+                max={240}
+                step={0.1}
+                value={bpm}
+                onChange={(e) => applyBpmValue(Number(e.target.value))}
+                className="w-20 rounded border border-zinc-700 bg-zinc-900 px-1.5 py-0.5 text-right font-mono text-xs text-zinc-100"
+              />
             </div>
             <input
               type="range"
               min={40}
               max={240}
+              step={0.1}
               value={bpm}
-              onChange={(e) => setBpm(Number(e.target.value))}
+              onChange={(e) => applyBpmValue(Number(e.target.value))}
               className="w-full accent-emerald-500"
             />
           </div>
@@ -899,15 +1094,15 @@ export default function StemMixer({
           <div>
             <div className="flex justify-between mb-1">
               <span>Geser Ketukan (Beat Grid)</span>
-              <span className="font-mono">{beatOffsetSec.toFixed(2)}s</span>
+              <span className="font-mono">{beatOffsetSec.toFixed(3)}s</span>
             </div>
             <input
               type="range"
               min={-2}
               max={2}
-              step={0.01}
+              step={0.001}
               value={beatOffsetSec}
-              onChange={(e) => setBeatOffsetSec(Number(e.target.value))}
+              onChange={(e) => handleBeatOffsetChange(Number(e.target.value))}
               className="w-full accent-emerald-500"
             />
           </div>
