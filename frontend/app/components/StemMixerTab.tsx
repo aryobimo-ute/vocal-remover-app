@@ -57,6 +57,10 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
   const [editingJobId, setEditingJobId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState("");
   const [savingTitleId, setSavingTitleId] = useState<string | null>(null);
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(
+    null,
+  );
+  const [deletingJobId, setDeletingJobId] = useState<string | null>(null);
 
   const [activeTrack, setActiveTrack] = useState<ActiveMixerTrack | null>(
     readInitialActiveTrack,
@@ -179,6 +183,7 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
   }
 
   function handleStartRename(item: LibraryItem) {
+    setConfirmingDeleteId(null);
     setEditingJobId(item.job_id);
     setEditingTitle(item.title);
   }
@@ -219,18 +224,33 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
     }
   }
 
+  function handleRequestDelete(targetJobId: string) {
+    setConfirmingDeleteId(targetJobId);
+  }
+
+  function handleCancelDelete() {
+    if (deletingJobId) return;
+    setConfirmingDeleteId(null);
+  }
+
   async function handleDeleteFromLibrary(targetJobId: string) {
-    const res = await fetch(`${apiUrl}/stem-library/${targetJobId}`, {
-      method: "DELETE",
-    });
-    if (res.ok) {
-      setLibrary((prev) => prev.filter((x) => x.job_id !== targetJobId));
-      if (editingJobId === targetJobId) {
-        handleCancelRename();
+    setDeletingJobId(targetJobId);
+    try {
+      const res = await fetch(`${apiUrl}/stem-library/${targetJobId}`, {
+        method: "DELETE",
+      });
+      if (res.ok) {
+        setLibrary((prev) => prev.filter((x) => x.job_id !== targetJobId));
+        if (editingJobId === targetJobId) {
+          handleCancelRename();
+        }
+        if (activeTrack?.jobId === targetJobId) {
+          setActiveTrack(null);
+        }
+        setConfirmingDeleteId(null);
       }
-      if (activeTrack?.jobId === targetJobId) {
-        setActiveTrack(null);
-      }
+    } finally {
+      setDeletingJobId(null);
     }
   }
 
@@ -282,10 +302,17 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
               const isSelected = activeTrack?.jobId === item.job_id;
               const isEditing = editingJobId === item.job_id;
               const isSaving = savingTitleId === item.job_id;
+              const isConfirmingDelete = confirmingDeleteId === item.job_id;
+              const isDeleting = deletingJobId === item.job_id;
 
               return (
                 <div
                   key={item.job_id}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape" && isConfirmingDelete) {
+                      handleCancelDelete();
+                    }
+                  }}
                   className={`py-2.5 flex flex-wrap items-center justify-between gap-2 ${
                     isSelected ? "bg-emerald-950/20 px-2 rounded-lg" : ""
                   }`}
@@ -335,13 +362,19 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
                       {item.detected_bpm} BPM • {item.stems.length} stem •{" "}
                       {item.created_at}
                     </p>
+                    {isConfirmingDelete && (
+                      <p className="text-xs text-red-300 mt-1">
+                        Hapus lagu ini dari library beserta file stem-nya?
+                      </p>
+                    )}
                   </div>
 
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <button
                       type="button"
                       onClick={() => handleSelectFromLibrary(item)}
-                      className={`rounded-lg px-3 py-1.5 text-xs font-medium ${
+                      disabled={isDeleting}
+                      className={`rounded-lg px-3 py-1.5 text-xs font-medium disabled:opacity-50 ${
                         isSelected
                           ? "bg-emerald-600 text-white"
                           : "bg-zinc-800 text-zinc-100 hover:bg-zinc-700"
@@ -349,22 +382,47 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
                     >
                       {isSelected ? "Sedang Dibuka" : "Buka di Mixer"}
                     </button>
-                    {!isEditing && (
+                    {!isEditing && !isConfirmingDelete && (
                       <button
                         type="button"
                         onClick={() => handleStartRename(item)}
-                        className="rounded-lg border border-zinc-700 px-2.5 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800"
+                        disabled={isDeleting}
+                        className="rounded-lg border border-zinc-700 px-2.5 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800 disabled:opacity-50"
                       >
                         Edit Nama
                       </button>
                     )}
-                    <button
-                      type="button"
-                      onClick={() => void handleDeleteFromLibrary(item.job_id)}
-                      className="rounded-lg border border-zinc-800 px-2.5 py-1.5 text-xs text-zinc-400 hover:border-red-800 hover:text-red-300"
-                    >
-                      Hapus
-                    </button>
+                    {isConfirmingDelete ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            void handleDeleteFromLibrary(item.job_id)
+                          }
+                          disabled={isDeleting}
+                          className="rounded-lg bg-red-600 px-2.5 py-1.5 text-xs font-medium text-white hover:bg-red-500 disabled:opacity-50"
+                        >
+                          {isDeleting ? "Menghapus..." : "Ya, Hapus"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleCancelDelete}
+                          disabled={isDeleting}
+                          className="rounded-lg border border-zinc-700 px-2.5 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800 disabled:opacity-50"
+                        >
+                          Batal
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => handleRequestDelete(item.job_id)}
+                        disabled={isDeleting}
+                        className="rounded-lg border border-zinc-800 px-2.5 py-1.5 text-xs text-zinc-400 hover:border-red-800 hover:text-red-300 disabled:opacity-50"
+                      >
+                        Hapus
+                      </button>
+                    )}
                   </div>
                 </div>
               );
