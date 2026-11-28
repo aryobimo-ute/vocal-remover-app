@@ -54,6 +54,10 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
 
   const [library, setLibrary] = useState<LibraryItem[]>([]);
   const [loadingLibrary, setLoadingLibrary] = useState(false);
+  const [editingJobId, setEditingJobId] = useState<string | null>(null);
+  const [editingTitle, setEditingTitle] = useState("");
+  const [savingTitleId, setSavingTitleId] = useState<string | null>(null);
+
   const [activeTrack, setActiveTrack] = useState<ActiveMixerTrack | null>(
     readInitialActiveTrack,
   );
@@ -174,12 +178,56 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
     });
   }
 
+  function handleStartRename(item: LibraryItem) {
+    setEditingJobId(item.job_id);
+    setEditingTitle(item.title);
+  }
+
+  function handleCancelRename() {
+    setEditingJobId(null);
+    setEditingTitle("");
+  }
+
+  async function handleSaveRename(targetJobId: string) {
+    const trimmed = editingTitle.trim();
+    if (!trimmed) return;
+    setSavingTitleId(targetJobId);
+    try {
+      const res = await fetch(`${apiUrl}/stem-library/${targetJobId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: trimmed }),
+      });
+      if (!res.ok) return;
+      const data: { item?: LibraryItem } = await res.json();
+      const finalTitle = data.item?.title ?? trimmed;
+
+      setLibrary((prev) =>
+        prev.map((x) =>
+          x.job_id === targetJobId ? { ...x, title: finalTitle } : x,
+        ),
+      );
+      setActiveTrack((prev) =>
+        prev && prev.jobId === targetJobId
+          ? { ...prev, title: finalTitle }
+          : prev,
+      );
+      setEditingJobId(null);
+      setEditingTitle("");
+    } finally {
+      setSavingTitleId(null);
+    }
+  }
+
   async function handleDeleteFromLibrary(targetJobId: string) {
     const res = await fetch(`${apiUrl}/stem-library/${targetJobId}`, {
       method: "DELETE",
     });
     if (res.ok) {
       setLibrary((prev) => prev.filter((x) => x.job_id !== targetJobId));
+      if (editingJobId === targetJobId) {
+        handleCancelRename();
+      }
       if (activeTrack?.jobId === targetJobId) {
         setActiveTrack(null);
       }
@@ -232,6 +280,9 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
           <div className="divide-y divide-zinc-800/80 max-h-56 overflow-y-auto">
             {library.map((item) => {
               const isSelected = activeTrack?.jobId === item.job_id;
+              const isEditing = editingJobId === item.job_id;
+              const isSaving = savingTitleId === item.job_id;
+
               return (
                 <div
                   key={item.job_id}
@@ -240,9 +291,46 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
                   }`}
                 >
                   <div className="min-w-0 flex-1">
-                    <p className="text-sm font-medium text-zinc-100 truncate">
-                      {item.title}
-                    </p>
+                    {isEditing ? (
+                      <div className="flex flex-wrap items-center gap-2 pr-2">
+                        <input
+                          type="text"
+                          value={editingTitle}
+                          onChange={(e) => setEditingTitle(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              void handleSaveRename(item.job_id);
+                            } else if (e.key === "Escape") {
+                              handleCancelRename();
+                            }
+                          }}
+                          disabled={isSaving}
+                          autoFocus
+                          className="flex-1 min-w-[180px] rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => void handleSaveRename(item.job_id)}
+                          disabled={isSaving || !editingTitle.trim()}
+                          className="rounded-lg bg-emerald-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
+                        >
+                          {isSaving ? "Menyimpan..." : "Simpan"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleCancelRename}
+                          disabled={isSaving}
+                          className="rounded-lg border border-zinc-700 px-2.5 py-1 text-xs text-zinc-300 hover:bg-zinc-800"
+                        >
+                          Batal
+                        </button>
+                      </div>
+                    ) : (
+                      <p className="text-sm font-medium text-zinc-100 truncate">
+                        {item.title}
+                      </p>
+                    )}
                     <p className="text-[11px] font-mono text-zinc-400">
                       {item.detected_bpm} BPM • {item.stems.length} stem •{" "}
                       {item.created_at}
@@ -261,6 +349,15 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
                     >
                       {isSelected ? "Sedang Dibuka" : "Buka di Mixer"}
                     </button>
+                    {!isEditing && (
+                      <button
+                        type="button"
+                        onClick={() => handleStartRename(item)}
+                        className="rounded-lg border border-zinc-700 px-2.5 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800"
+                      >
+                        Edit Nama
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={() => void handleDeleteFromLibrary(item.job_id)}

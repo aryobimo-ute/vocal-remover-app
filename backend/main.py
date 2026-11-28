@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 import librosa
 import numpy as np
+from pydantic import BaseModel
 import torch
 
 app = FastAPI()
@@ -45,6 +46,10 @@ jobs: dict[str, dict] = {}
 PERCENT_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)%")
 
 
+class LibraryRenameRequest(BaseModel):
+    title: str
+
+
 def _read_library_unlocked() -> list[dict]:
     if not LIBRARY_FILE.exists():
         return []
@@ -70,6 +75,25 @@ def save_stem_to_library(entry: dict):
             json.dumps(items, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+
+
+def rename_stem_in_library(job_id: str, new_title: str) -> Optional[dict]:
+    with library_lock:
+        items = _read_library_unlocked()
+        updated_item: Optional[dict] = None
+        for item in items:
+            if item.get("job_id") == job_id:
+                item["title"] = new_title
+                updated_item = item
+                break
+        if updated_item is None:
+            return None
+        BASE_DIR.mkdir(parents=True, exist_ok=True)
+        LIBRARY_FILE.write_text(
+            json.dumps(items, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return updated_item
 
 
 def remove_stem_from_library(job_id: str) -> bool:
@@ -512,6 +536,18 @@ async def separate_stems(
 @app.get("/stem-library")
 def get_stem_library():
     return {"items": load_stem_library()}
+
+
+@app.patch("/stem-library/{job_id}")
+def rename_stem_library_item(job_id: str, payload: LibraryRenameRequest):
+    safe_id = os.path.basename(job_id)
+    cleaned_title = payload.title.strip()
+    if not cleaned_title:
+        raise HTTPException(status_code=400, detail="Nama label tidak boleh kosong.")
+    updated = rename_stem_in_library(safe_id, cleaned_title)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Item library tidak ditemukan.")
+    return {"updated": True, "item": updated}
 
 
 @app.delete("/stem-library/{job_id}")
