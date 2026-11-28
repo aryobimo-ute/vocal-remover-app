@@ -87,7 +87,7 @@ Aktifkan `.venv`:
 Jalankan _server_ backend:
 
 ```bash
-uvicorn main:app --reload --port 8000
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 > **Catatan:**

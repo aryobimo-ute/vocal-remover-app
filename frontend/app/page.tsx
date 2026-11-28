@@ -4,7 +4,10 @@ import { useState } from "react";
 import VocalSubtitleTab from "./components/VocalSubtitleTab";
 import StemMixerTab from "./components/StemMixerTab";
 
-const API_URL = "http://localhost:8000";
+const API_URL =
+  typeof window !== "undefined"
+    ? `http://${window.location.hostname}:8000`
+    : "http://localhost:8000";
 
 export default function HomePage() {
   const [activeTab, setActiveTab] = useState<"vocal-subtitle" | "stem-mixer">(

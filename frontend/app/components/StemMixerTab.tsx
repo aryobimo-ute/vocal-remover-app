@@ -391,8 +391,8 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
 
       {/* Library Lagu yang Sudah Dipisah per Line */}
       <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-4 space-y-3">
-        <div className="flex items-center justify-between">
-          <div>
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0">
             <h3 className="text-sm font-semibold text-zinc-100">
               Library Lagu Terpisah ({library.length})
             </h3>
@@ -403,7 +403,7 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
           <button
             type="button"
             onClick={() => void handleRefreshLibrary()}
-            className="rounded-lg border border-zinc-700 px-3 py-1 text-xs text-zinc-200 hover:bg-zinc-800"
+            className="self-start sm:self-auto shrink-0 rounded-lg border border-zinc-700 px-3 py-1 text-xs text-zinc-200 hover:bg-zinc-800"
           >
             {loadingLibrary ? "Memuat..." : "Refresh Library"}
           </button>
@@ -434,13 +434,13 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
                       handleCancelDelete();
                     }
                   }}
-                  className={`py-2.5 flex flex-wrap items-center justify-between gap-2 ${
+                  className={`py-2.5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2.5 ${
                     isSelected ? "bg-emerald-950/20 px-2 rounded-lg" : ""
                   }`}
                 >
-                  <div className="min-w-0 flex-1">
+                  <div className="w-full sm:w-auto sm:min-w-0 sm:flex-1">
                     {isEditing ? (
-                      <div className="flex flex-wrap items-center gap-2 pr-2">
+                      <div className="flex flex-wrap items-center gap-2 sm:pr-2">
                         <input
                           type="text"
                           value={editingTitle}
@@ -475,7 +475,10 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
                         </button>
                       </div>
                     ) : (
-                      <p className="text-sm font-medium text-zinc-100 truncate">
+                      <p
+                        title={item.title}
+                        className="text-sm font-medium text-zinc-100 break-words sm:truncate"
+                      >
                         {item.title}
                       </p>
                     )}
@@ -490,7 +493,7 @@ export default function StemMixerTab({ apiUrl }: { apiUrl: string }) {
                     )}
                   </div>
 
-                  <div className="flex flex-wrap items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto sm:shrink-0">
                     <button
                       type="button"
                       onClick={() => handleSelectFromLibrary(item)}
