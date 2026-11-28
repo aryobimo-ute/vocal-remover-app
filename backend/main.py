@@ -26,9 +26,9 @@ app.add_middleware(
 )
 
 BASE_DIR = Path(__file__).parent / "work"
-BASE_DIR.mkdir(exist_ok=True)
+BASE_DIR.mkdir(parents=True, exist_ok=True)
 LIBRARY_FILE = BASE_DIR / "stem_library.json"
-library_lock = threading.Lock()
+library_lock = threading.RLock()
 
 whisper_device = "cuda" if torch.cuda.is_available() else "cpu"
 whisper_compute_type = "float16" if whisper_device == "cuda" else "int8"
@@ -45,20 +45,25 @@ jobs: dict[str, dict] = {}
 PERCENT_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)%")
 
 
+def _read_library_unlocked() -> list[dict]:
+    if not LIBRARY_FILE.exists():
+        return []
+    try:
+        data = json.loads(LIBRARY_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
 def load_stem_library() -> list[dict]:
     with library_lock:
-        if not LIBRARY_FILE.exists():
-            return []
-        try:
-            data = json.loads(LIBRARY_FILE.read_text(encoding="utf-8"))
-            return data if isinstance(data, list) else []
-        except Exception:
-            return []
+        return _read_library_unlocked()
 
 
 def save_stem_to_library(entry: dict):
     with library_lock:
-        items = load_stem_library()
+        BASE_DIR.mkdir(parents=True, exist_ok=True)
+        items = _read_library_unlocked()
         items = [x for x in items if x.get("job_id") != entry.get("job_id")]
         items.insert(0, entry)
         LIBRARY_FILE.write_text(
@@ -69,7 +74,7 @@ def save_stem_to_library(entry: dict):
 
 def remove_stem_from_library(job_id: str) -> bool:
     with library_lock:
-        items = load_stem_library()
+        items = _read_library_unlocked()
         new_items = [x for x in items if x.get("job_id") != job_id]
         if len(new_items) == len(items):
             return False
@@ -348,12 +353,17 @@ def execute_stem_job(job_id: str, input_path: Path, job_dir: Path):
             "detected_bpm": final_bpm,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
-        save_stem_to_library(library_entry)
+
+        try:
+            save_stem_to_library(library_entry)
+            log_step(job_id, "LIBRARY", "Berhasil menyimpan ke Library Lagu Terpisah.", progress=98)
+        except Exception as lib_exc:
+            log_step(job_id, "LIBRARY", f"Gagal menyimpan ke library ({lib_exc}), tetap lanjutkan ke mixer.", progress=98)
 
         total_s = time.perf_counter() - total_start
         log_step(job_id, "DONE", f"Pemisahan stem selesai dalam {total_s:.1f}s", progress=100)
-        jobs[job_id]["status"] = "completed"
         jobs[job_id]["stems"] = available_stems
+        jobs[job_id]["status"] = "completed"
     except Exception as exc:
         log_step(job_id, "ERROR", str(exc))
         jobs[job_id]["status"] = "failed"
